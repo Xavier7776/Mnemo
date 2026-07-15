@@ -753,7 +753,7 @@ async def chat(
 ) -> StreamingResponse:
     """
     常规对话（匿名模式）
-    使用 PhysicsAssistantAgent 处理，支持 RAG 检索增强与来源返回。
+    使用 GeneralAssistantAgent 处理，支持 RAG 检索增强与来源返回。
     支持客户端断开连接检测，断开时自动停止流式输出
     """
     logger.info(f"对话请求 - 问题: {chat_request.query[:50]}...")
@@ -836,7 +836,13 @@ async def chat(
                             # 发送文本chunk
                             data = json.dumps({"content": chunk}, ensure_ascii=False) #代表不要把中文转译为如\\ox12这样的
                             yield f"data: {data}\n\n"
-                        
+
+                        elif result.get("type") == "thinking":
+                            # 思考链 chunk（推理模型的 reasoning_content）
+                            thinking_chunk = result.get("content", "")
+                            data = json.dumps({"thinking": thinking_chunk}, ensure_ascii=False)
+                            yield f"data: {data}\n\n"
+
                         elif result.get("type") == "tool_call":
                             tool_call_data = {
                                 "tool_call": {

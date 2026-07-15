@@ -15,7 +15,6 @@ from agents.experts.summary_agent import SummaryAgent
 from agents.experts.exercise_agent import ExerciseAgent
 from agents.experts.scientific_coding_agent import ScientificCodingAgent
 from agents.experts.critic_agent import CriticAgent
-from agents.experts.argument_analysis_agent import ArgumentAnalysisAgent
 
 
 async def get_agent_config(agent_type: str) -> Dict[str, Optional[str]]:
@@ -45,7 +44,6 @@ class AgentWorkflow:
         "exercise": ExerciseAgent,
         "scientific_coding": ScientificCodingAgent,
         "critic": CriticAgent,
-        "argument_analysis": ArgumentAnalysisAgent,
     }
     
     def __init__(self):

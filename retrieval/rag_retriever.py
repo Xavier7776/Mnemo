@@ -101,19 +101,35 @@ class RAGRetriever:
         embedding_model: Optional[str] = None,
         query_variants: Optional[List[str]] = None,
         graph_enabled: Optional[bool] = None,
+        strategy: str = "auto",
+        exclude_chunk_ids: Optional[set] = None,
     ) -> List[Dict[str, Any]]:
         """
         异步检索相关文档块 (High-level RAG)
-        
+
         Args:
             query: 查询文本
             document_id: 可选的文档ID过滤
             collection_name: 可选的集合名称（用于多助手支持）
             embedding_model: 可选的向量模型名称
             query_variants: 同一个问题的多个问法,一般由LLM自动生成
+            strategy: 检索策略
+                - "auto"/"hybrid": 三路混合（向量+BM25+图谱）+ RRF + CrossEncoder（默认）
+                - "vector": 仅向量语义检索
+                - "keyword": 仅 BM25 关键词检索
+                - "graph": 仅图谱检索
+            exclude_chunk_ids: 需要排除的 chunk_id 集合（用于 Agent 跨轮次去重）
         Returns:
             检索结果列表，包含文本、相似度分数、元数据等
         """
+        # 归一化 strategy，决定启用哪些检索路径
+        strategy = (strategy or "auto").lower()
+        if strategy == "hybrid":
+            strategy = "auto"
+        use_vector = strategy in ("auto", "vector")
+        use_keyword = strategy in ("auto", "keyword")
+        use_graph = strategy in ("auto", "graph")
+
         # 运行时开关：决定是否启用图谱检索/重排等高耗模块
         try:
             from services.runtime_config import get_runtime_config
@@ -126,44 +142,77 @@ class RAGRetriever:
             modules = {}
 
         if graph_enabled is None:
-            graph_enabled = bool(modules.get("kg_retrieve_enabled", True))
+            graph_enabled = bool(modules.get("kg_retrieve_enabled", True)) and use_graph
 
-        # 1. 并行执行多种检索策略
+        # 1. 并行执行多种检索策略（按 strategy 选择性启用）
         queries = [q for q in (query_variants or [query]) if q and q.strip()]
         if not queries:
             queries = [query]
 
-        vector_tasks = [
-            self._vector_search(q, document_id, collection_name, embedding_model)
-            for q in queries
-        ]
+        tasks = []
+        task_names = []
 
-        keyword_tasks = [
-            self._keyword_search(q, document_id)
-            for q in queries
-        ]
-        tasks = [
-            asyncio.gather(*vector_tasks),
-            asyncio.gather(*keyword_tasks),
-            (self._graph_search(query, document_id) if graph_enabled else asyncio.sleep(0, result=[])),
-        ]
-        
+        if use_vector:
+            vector_tasks = [
+                self._vector_search(q, document_id, collection_name, embedding_model)
+                for q in queries
+            ]
+            tasks.append(asyncio.gather(*vector_tasks))
+            task_names.append("vector")
+
+        if use_keyword:
+            keyword_tasks = [
+                self._keyword_search(q, document_id)
+                for q in queries
+            ]
+            tasks.append(asyncio.gather(*keyword_tasks))
+            task_names.append("keyword")
+
+        if use_graph and graph_enabled:
+            tasks.append(self._graph_search(query, document_id))
+            task_names.append("graph")
+
+        # 兜底：若所有路径都被禁用，退化为向量检索
+        if not tasks:
+            vector_tasks = [
+                self._vector_search(q, document_id, collection_name, embedding_model)
+                for q in queries
+            ]
+            tasks.append(asyncio.gather(*vector_tasks))
+            task_names.append("vector")
+
         results_list = await asyncio.gather(*tasks)
-        #3个结果
-        vector_groups, keyword_groups, graph_results = results_list
-        #获得如下结果
-        # [
-        #     {"id": "c2", "score": 0.95, "_variant_rank": 1},
-        #     {"id": "c1", "score": 0.92, "_variant_rank": 1},
-        #     {"id": "c4", "score": 0.88, "_variant_rank": 2},
-        #     {"id": "c3", "score": 0.71, "_variant_rank": 3},
-        # ]
+
+        # 按 task_names 顺序解析各路结果，缺失的路用空列表占位
+        vector_groups: List[List[Dict[str, Any]]] = []
+        keyword_groups: List[List[Dict[str, Any]]] = []
+        graph_results: List[Dict[str, Any]] = []
+
+        for name, res in zip(task_names, results_list):
+            if name == "vector":
+                vector_groups = res
+            elif name == "keyword":
+                keyword_groups = res
+            elif name == "graph":
+                graph_results = res
+
         vector_results = self._flatten_ranked_groups(vector_groups)
         keyword_results = self._flatten_ranked_groups(keyword_groups)
         
         # 2. 混合检索结果（合并和初步去重）
         merged_results = self._merge_results(vector_results, keyword_results, graph_results)
-        
+
+        # 2.5 排除已检索过的 chunk（Agent 跨轮次去重）
+        if exclude_chunk_ids:
+            before_count = len(merged_results)
+            merged_results = [
+                r for r in merged_results
+                if r.get("payload", {}).get("chunk_id") not in exclude_chunk_ids
+                and r.get("id") not in exclude_chunk_ids
+            ]
+            if before_count != len(merged_results):
+                logger.debug(f"exclude_chunk_ids 过滤: {before_count} -> {len(merged_results)}")
+
         # 3. 重排 (Rerank)
         reranker = self._get_reranker()
         if reranker and merged_results:
@@ -274,7 +323,73 @@ class RAGRetriever:
             return []
 
     async def _keyword_search(self, query: str, document_id: Optional[str]) -> List[Dict[str, Any]]:
-        """关键词检索（用 asyncio.to_thread 包装同步 MongoDB + BM25 计算，避免阻塞事件循环）"""
+        """关键词检索 — 优先 Redis 倒排索引，fallback 到 MongoDB 全表扫描（阶段二改造）"""
+        query_terms = self._tokenize(query)
+        if not query_terms:
+            return []
+
+        # —— 优先尝试 Redis 倒排索引 ——
+        try:
+            from utils.redis_client import search_bm25, is_available
+            if is_available():
+                id_score_pairs = await asyncio.to_thread(
+                    search_bm25, query_terms, self.prefetch_k, document_id
+                )
+                if id_score_pairs:
+                    # Redis 返回 (chunk_id, score) 列表，从 MongoDB 回查 chunk text
+                    chunks = await asyncio.to_thread(self._fetch_chunks_by_ids, id_score_pairs)
+                    if chunks:
+                        logger.debug(f"Redis BM25 命中: {len(chunks)} 个 chunk (query='{query[:30]}')")
+                        return chunks
+                # Redis 无结果，继续 fallback 到 MongoDB
+        except Exception as e:
+            logger.warning(f"Redis BM25 检索失败，fallback 到 MongoDB: {e}")
+
+        # —— Fallback: 原有 MongoDB 全表扫描逻辑 ——
+        return await self._keyword_search_mongo(query, document_id)
+
+    def _fetch_chunks_by_ids(self, id_score_pairs: List[tuple]) -> List[Dict[str, Any]]:
+        """根据 Redis 返回的 (chunk_id, score) 列表，从 MongoDB 回查 chunk 完整信息"""
+        try:
+            from bson import ObjectId
+            chunk_ids = [cid for cid, _ in id_score_pairs]
+            score_map = {cid: score for cid, score in id_score_pairs}
+
+            # 批量查询 MongoDB
+            object_ids = []
+            for cid in chunk_ids:
+                try:
+                    object_ids.append(ObjectId(cid))
+                except Exception:
+                    continue
+            if not object_ids:
+                return []
+
+            cursor = self.chunk_repo.collection.find({"_id": {"$in": object_ids}})
+            results = []
+            for chunk in cursor:
+                cid = str(chunk["_id"])
+                score = score_map.get(cid, 0.0)
+                results.append({
+                    "id": cid,
+                    "score": score,
+                    "payload": {
+                        "chunk_id": cid,
+                        "document_id": chunk.get("document_id"),
+                        "text": chunk.get("text"),
+                        "chunk_index": chunk.get("chunk_index"),
+                        "metadata": chunk.get("metadata", {}),
+                    },
+                })
+            # 按 Redis 计算的 BM25 分数排序
+            results.sort(key=lambda x: x["score"], reverse=True)
+            return results
+        except Exception as e:
+            logger.error(f"回查 chunk 失败: {e}")
+            return []
+
+    async def _keyword_search_mongo(self, query: str, document_id: Optional[str]) -> List[Dict[str, Any]]:
+        """MongoDB 全表扫描 BM25（fallback 逻辑，原 _keyword_search 的实现）"""
         try:
             def _keyword_search_sync() -> List[Dict[str, Any]]:
                 chunks = []
@@ -340,7 +455,7 @@ class RAGRetriever:
 
             return await asyncio.to_thread(_keyword_search_sync)
         except Exception as e:
-            logger.error(f"关键词检索失败: {e}")
+            logger.error(f"关键词检索(MongoDB fallback)失败: {e}")
             return []
 
     def _tokenize(self, text: str) -> List[str]:

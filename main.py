@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 import os
 from dotenv import load_dotenv
-from routers import chat, documents, retrieval, assistants, health, knowledge_spaces, settings
+from routers import chat, documents, retrieval, assistants, health, knowledge_spaces, settings, mcp
 from utils.logger import logger
 from utils.lifespan import lifespan
 from middleware.logging_middleware import log_requests
@@ -96,6 +96,7 @@ app.include_router(assistants.router, prefix="/api/assistants", tags=["助手"])
 app.include_router(knowledge_spaces.router, prefix="/api/knowledge-spaces", tags=["知识空间"])
 app.include_router(settings.router, prefix="/api/settings", tags=["设置"])
 app.include_router(health.router, tags=["健康检查"])
+app.include_router(mcp.router, prefix="/api/mcp", tags=["MCP 管理"])
 
 
 @app.get("/")

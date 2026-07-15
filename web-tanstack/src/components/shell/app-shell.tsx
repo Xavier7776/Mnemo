@@ -1,6 +1,6 @@
 import { Link, Outlet, useRouterState } from "@tanstack/react-router"
 import { useQuery } from "@tanstack/react-query"
-import { Database, MessageSquareText, PanelLeftClose, PanelLeftOpen, Search, Sparkles } from "lucide-react"
+import { Database, MessageSquareText, PanelLeftClose, PanelLeftOpen, PlugZap, Search, Sparkles } from "lucide-react"
 
 import { api } from "@/lib/api"
 import { cn } from "@/lib/utils"
@@ -10,6 +10,7 @@ const navItems = [
   { to: "/chat", label: "对话", icon: MessageSquareText },
   { to: "/documents", label: "文档", icon: Database },
   { to: "/retrieval", label: "检索", icon: Search },
+  { to: "/mcp", label: "MCP", icon: PlugZap },
 ] as const
 
 function HealthPill() {

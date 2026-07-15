@@ -103,6 +103,27 @@ async def lifespan(app: FastAPI):
                 logger.info("Embedding 模型预热完成")
             except Exception as e:
                 logger.warning(f"Embedding 模型预热失败（不影响启动）: {e}")
+
+        # —— MCP Client 初始化 ——
+        import os
+        if os.getenv("MCP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}:
+            try:
+                from services.mcp_client_service import mcp_client_manager
+                from services.ai_tools import ai_tools
+                # 项目根目录 = lifespan.py 所在 utils 目录的上一级
+                base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                config_path = os.path.join(base_dir, "config", "mcp_servers.json")
+                await mcp_client_manager.initialize(config_path)
+                if mcp_client_manager.is_enabled:
+                    count = ai_tools.register_mcp_tools(mcp_client_manager)
+                    logger.info(f"MCP 工具已注册 {count} 个到 ai_tools")
+                else:
+                    logger.info("MCP 初始化完成但未启用（无 Server 连接成功或配置 disabled）")
+            except Exception as e:
+                logger.warning(f"MCP 初始化失败（不影响服务启动）: {e}", exc_info=True)
+        else:
+            logger.info("MCP_ENABLED 未启用，跳过 MCP 初始化")
+
     except Exception as e:
         logger.error(f"lifespan 异常: {str(e)}", exc_info=True)
         app.state.mongodb_ready = False
@@ -114,4 +135,12 @@ async def lifespan(app: FastAPI):
         await mongodb.disconnect()
     except Exception as e:
         logger.error(f"关闭数据库连接时出错: {str(e)}", exc_info=True)
+
+    # 关闭 MCP 连接
+    try:
+        from services.mcp_client_service import mcp_client_manager
+        if mcp_client_manager.is_initialized:
+            await mcp_client_manager.shutdown()
+    except Exception as e:
+        logger.warning(f"关闭 MCP 连接时出错: {e}")
 

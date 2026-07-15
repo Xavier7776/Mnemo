@@ -835,7 +835,16 @@ class ChunkRepository:
             "created_at": beijing_now()
         }
         result = self.collection.insert_one(chunk)
-        return str(result.inserted_id)
+        chunk_id = str(result.inserted_id)
+        # 阶段二：同步构建 Redis 倒排索引（失败不影响 MongoDB 入库）
+        try:
+            from utils.redis_client import index_chunk, is_available
+            if is_available():
+                index_chunk(chunk_id, text, document_id)
+        except Exception as e:
+            from utils.logger import logger
+            logger.warning(f"Redis 倒排索引构建失败 (chunk_id={chunk_id}): {e}")
+        return chunk_id
     
     def get_chunks_by_document(self, document_id: str) -> List[Dict[str, Any]]:
         """获取文档的所有块"""
@@ -872,6 +881,18 @@ class ChunkRepository:
     
     def delete_chunks_by_document(self, document_id: str):
         """删除文档的所有块"""
+        # 阶段二：删除前先清理 Redis 倒排索引
+        try:
+            from utils.redis_client import remove_chunk, is_available
+            if is_available():
+                chunks = self.collection.find(
+                    {"document_id": document_id}, {"_id": 1}
+                )
+                for chunk in chunks:
+                    remove_chunk(str(chunk["_id"]))
+        except Exception as e:
+            from utils.logger import logger
+            logger.warning(f"Redis 倒排索引清理失败 (document_id={document_id}): {e}")
         self.collection.delete_many({"document_id": document_id})
 
 

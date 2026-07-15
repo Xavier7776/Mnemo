@@ -1,0 +1,68 @@
+{
+  "enabled": true,
+  "servers": {
+    "fetch": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-fetch"
+      ],
+      "env": {},
+      "enabled": false,
+      "timeout": 30
+    },
+    "github": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-github"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      },
+      "enabled": false,
+      "timeout": 30
+    },
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "D:\\"
+      ],
+      "env": {},
+      "url": null,
+      "enabled": true,
+      "timeout": 30
+    },
+    "firecrawl-mcp": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "firecrawl-mcp"
+      ],
+      "env": {
+        "FIRECRAWL_API_KEY": "fc-60fb4ecff4ea405682c5141fdc776a58"
+      },
+      "url": null,
+      "enabled": true,
+      "timeout": 30
+    },
+    "time": {
+      "transport": "stdio",
+      "command": "uvx",
+      "args": [
+        "mcp-server-time",
+        "--local-timezone=Asia/Shanghai"
+      ],
+      "env": {},
+      "url": null,
+      "enabled": true,
+      "timeout": 30
+    }
+  }
+}

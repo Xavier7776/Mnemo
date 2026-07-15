@@ -12,6 +12,8 @@ motor>=3.3.0
 qdrant-client>=1.7.0
 neo4j>=5.15.0
 sentence-transformers>=2.2.0
+# 阶段二：Redis 倒排索引（BM25 加速）
+redis>=5.0.0
 
 # 环境与配置
 python-dotenv>=1.0.0
@@ -39,3 +41,5 @@ pydantic>=2.0.0
 # 测试
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
+# MCP Client SDK
+mcp>=1.6.0

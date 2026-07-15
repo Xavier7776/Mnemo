@@ -68,9 +68,17 @@ class LLMService:
         document_info: Optional[Dict[str, Any]] = None,
         knowledge_base_status: Optional[Dict[str, Any]] = None,
         assistant_id: Optional[str] = None,
-        conversation_history: Optional[List[Dict[str, Any]]] = None
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        tool_execution_context: Optional[Dict[str, Any]] = None
     ) -> AsyncGenerator[str, None]:
-        """生成回复（流式或非流式）"""
+        """生成回复（流式或非流式）
+
+        Args:
+            tool_execution_context: Agent 工具执行上下文，用于向 rag_retrieve 等工具
+                注入 document_id/assistant_id/knowledge_space_ids/embedding_model 和
+                跨轮次去重状态（retrieval_context.seen_chunk_ids / total_retrieval_count）。
+                仅在 Agentic RAG 模式下由 GeneralAssistantAgent 传入。
+        """
         messages, tool_context_added = await self._build_messages(
             prompt, context,
             document_id=document_id,
@@ -79,9 +87,13 @@ class LLMService:
             assistant_id=assistant_id,
             conversation_history=conversation_history
         )
-        
+
         if stream:
-            async for chunk in self._generate_stream(messages, assistant_id=assistant_id):
+            async for chunk in self._generate_stream(
+                messages,
+                assistant_id=assistant_id,
+                tool_execution_context=tool_execution_context,
+            ):
                 yield chunk
         else:
             response = await self._generate_once(messages)
@@ -294,6 +306,12 @@ class LLMService:
                     params[pname] = float(pvalue)
                 elif pvalue.lower() in ('true', 'false'):
                     params[pname] = pvalue.lower() == 'true'
+                elif pvalue.startswith(('[', '{')):
+                    # JSON 结构（数组/对象）反序列化，避免传给 MCP 时变成字符串
+                    try:
+                        params[pname] = json.loads(pvalue)
+                    except json.JSONDecodeError:
+                        params[pname] = pvalue
                 else:
                     params[pname] = pvalue
             
@@ -324,9 +342,15 @@ class LLMService:
         self,
         messages: List[Dict[str, str]],
         assistant_id: Optional[str] = None,
-        max_tool_rounds: int = 4,
+        max_tool_rounds: int = 20,
+        tool_execution_context: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[str, None]:
-        """流式生成 + 工具调用循环"""
+        """流式生成 + 工具调用循环
+
+        Args:
+            tool_execution_context: Agentic RAG 工具执行上下文，用于向 rag_retrieve
+                工具注入检索范围参数和跨轮次去重状态。
+        """
         import re
         from services.ai_tools import ai_tools
 
@@ -350,12 +374,21 @@ class LLMService:
                 )
 
                 full_response = ""
+                yielded_length = 0  # 跟踪已 yield 的位置，避免重复输出
                 tool_call_detected = False
                 chunk_count = 0
 
                 async for chunk in stream:
                     if chunk.choices and len(chunk.choices) > 0:
                         delta = chunk.choices[0].delta
+
+                        # 提取思考链（reasoning_content）— 推理模型（DeepSeek-R1、mimo-thinking 等）会输出此字段
+                        reasoning = getattr(delta, "reasoning_content", None)
+                        if reasoning is None and hasattr(delta, "model_extra"):
+                            reasoning = (delta.model_extra or {}).get("reasoning_content")
+                        if reasoning:
+                            yield "\x1eTHINKING:" + json.dumps({"content": reasoning}, ensure_ascii=False) + "\x1e"
+
                         if delta and delta.content:
                             chunk_count += 1
                             full_response += delta.content
@@ -365,13 +398,24 @@ class LLMService:
                                 continue
                             if tool_call_start in full_response:
                                 tool_call_detected = True
-                                # 先输出标签之前的正常文本
+                                # 只输出尚未 yield 的部分（避免重复）
                                 idx = full_response.find(tool_call_start)
-                                before_text = full_response[:idx]
+                                before_text = full_response[yielded_length:idx]
                                 if before_text:
                                     yield before_text
+                                yielded_length = idx
+                                continue
+                            # 阶段三修复：检测不完整的 <function 前缀（LLM 可能输出 <function 而非 <function_calls>）
+                            if '<function' in full_response and tool_call_start not in full_response:
+                                tool_call_detected = True
+                                idx = full_response.find('<function')
+                                before_text = full_response[yielded_length:idx]
+                                if before_text:
+                                    yield before_text
+                                yielded_length = idx
                                 continue
                             yield delta.content
+                            yielded_length = len(full_response)
 
                 logger.info(f"流式生成 - 第{round_idx + 1}轮完成, {chunk_count} 块, 长度 {len(full_response)}, 工具调用: {tool_call_detected}")
 
@@ -390,7 +434,11 @@ class LLMService:
 
             if not tool_call_detected or round_idx >= max_tool_rounds:
                 if tool_call_detected and full_response:
-                    cleaned = re.sub(pattern, '', full_response).strip()
+                    # 只处理尚未 yield 的部分，避免重复输出
+                    remaining = full_response[yielded_length:]
+                    cleaned = re.sub(pattern, '', remaining).strip()
+                    # 阶段三修复：移除不完整的 <function 标记（LLM 输出的非标准格式）
+                    cleaned = re.sub(r'<function(?!_calls>)[^\n]*\n?', '', cleaned).strip()
                     if cleaned:
                         yield cleaned
                 return
@@ -419,6 +467,12 @@ class LLMService:
                         params[pname] = float(pvalue)
                     elif pvalue.lower() in ('true', 'false'):
                         params[pname] = pvalue.lower() == 'true'
+                    elif pvalue.startswith(('[', '{')):
+                        # JSON 结构（数组/对象）反序列化
+                        try:
+                            params[pname] = json.loads(pvalue)
+                        except json.JSONDecodeError:
+                            params[pname] = pvalue
                     else:
                         params[pname] = pvalue
 
@@ -428,15 +482,55 @@ class LLMService:
                     params["assistant_id"] = assistant_id
 
                 try:
-                    result = await ai_tools.async_call_tool(tool_name, params if params else None)
+                    # === Agentic RAG: rag_retrieve 工具特殊处理 ===
+                    # 不走 async_call_tool，直接调用 rag_retrieve_with_context
+                    # 注入 tool_execution_context 中的检索范围参数和去重状态
+                    if tool_name == "rag_retrieve" and tool_execution_context is not None:
+                        retrieval_ctx = tool_execution_context.get("retrieval_context") or {}
+                        # 检索次数安全阀
+                        max_retrievals = retrieval_ctx.get("max_retrievals", 5)
+                        current_count = retrieval_ctx.get("total_retrieval_count", 0)
+                        if current_count >= max_retrievals:
+                            result = {
+                                "error": f"已达到最大检索次数限制（{max_retrievals}次），请基于已有信息回答",
+                                "max_retrievals_reached": True,
+                                "query": params.get("query", ""),
+                                "chunks": [],
+                                "total_found": 0,
+                            }
+                            logger.warning(f"rag_retrieve 达到最大检索次数限制: {max_retrievals}")
+                        else:
+                            result = await ai_tools.rag_retrieve_with_context(
+                                query=params.get("query", ""),
+                                strategy=params.get("strategy", "auto"),
+                                top_k=params.get("top_k", 5),
+                                min_score=params.get("min_score", 0.3),
+                                document_id=tool_execution_context.get("document_id"),
+                                assistant_id=tool_execution_context.get("assistant_id") or assistant_id,
+                                knowledge_space_ids=tool_execution_context.get("knowledge_space_ids"),
+                                embedding_model=tool_execution_context.get("embedding_model"),
+                                exclude_chunk_ids=retrieval_ctx.get("seen_chunk_ids", set()),
+                            )
+                            # 更新去重状态
+                            retrieval_ctx["total_retrieval_count"] = current_count + 1
+                            for chunk in result.get("chunks", []):
+                                cid = chunk.get("chunk_id")
+                                if cid:
+                                    retrieval_ctx.setdefault("seen_chunk_ids", set()).add(cid)
+                            logger.info(f"rag_retrieve 调用成功 (第{current_count + 1}次), 返回 {result.get('total_found', 0)} 个片段")
+                    else:
+                        result = await ai_tools.async_call_tool(tool_name, params if params else None)
+                        logger.info(f"工具调用成功: {tool_name}")
                     tool_results.append({"tool": tool_name, "params": params, "result": result})
-                    logger.info(f"工具调用成功: {tool_name}")
                 except Exception as e:
                     logger.error(f"工具调用 {tool_name} 失败: {str(e)}", exc_info=True)
                     tool_results.append({"tool": tool_name, "params": params, "result": {"success": False, "error": str(e)}})
 
             if not tool_results:
-                cleaned = re.sub(pattern, '', full_response).strip()
+                remaining = full_response[yielded_length:]
+                cleaned = re.sub(pattern, '', remaining).strip()
+                # 阶段三修复：移除不完整的 <function 标记
+                cleaned = re.sub(r'<function(?!_calls>)[^\n]*\n?', '', cleaned).strip()
                 if cleaned:
                     yield cleaned
                 return
@@ -456,19 +550,174 @@ class LLMService:
             }
             yield "\x1eTOOL_CALL:" + json.dumps(tool_call_event, ensure_ascii=False) + "\x1e"
 
+            # —— 阶段三：Observe（观察）+ Reflect（反思）——
+            # 对 rag_retrieve 工具结果做证据验证和反思，决定是否继续检索
+            reflection_result = None
+            if tool_execution_context is not None:
+                reflection_result = await self._observe_and_reflect(
+                    tool_results, tool_execution_context, round_idx + 1
+                )
+
             results_text = "\n\n工具函数调用结果：\n"
             for tr in tool_results:
                 results_text += f"\n调用 {tr['tool']} 的结果：\n{json.dumps(tr['result'], ensure_ascii=False, indent=2)}\n"
 
             current_messages.append({"role": "assistant", "content": full_response})
-            current_messages.append({
-                "role": "user",
-                "content": (
-                    f"工具调用结果如下：{results_text}\n\n"
-                    f"请基于以上工具返回的实时数据，用自然语言回答用户的问题。"
-                    f"不要再输出 <function_calls> 格式，直接给出最终回答。"
-                )
+
+            # —— 阶段三：基于反思结果动态生成下一轮提示 ——
+            if reflection_result and not reflection_result.get("sufficient", True):
+                # 证据不足，引导 Agent 继续检索
+                gaps_text = "；".join(reflection_result.get("gaps", [])) or "证据不够充分"
+                next_query_hint = ""
+                if reflection_result.get("next_query") and reflection_result.get("next_query") != reflection_result.get("original_query", ""):
+                    next_query_hint = f"\n建议尝试用不同的查询关键词再次检索，例如：'{reflection_result['next_query']}'"
+
+                current_messages.append({
+                    "role": "user",
+                    "content": (
+                        f"工具调用结果如下：{results_text}\n\n"
+                        f"⚠️ 检索反思：{gaps_text}。{next_query_hint}\n"
+                        f"如果认为需要更多信息，请调用 rag_retrieve 工具再次检索（换用不同关键词或策略）。"
+                        f"如果认为现有信息已足够回答，请直接给出最终回答。"
+                    )
+                })
+                logger.info(f"阶段三反思: 证据不足({gaps_text})，引导继续检索 (round={round_idx+1})")
+            else:
+                # 证据充分或无反思（非 RAG 工具）
+                # 检查是否有失败的工具调用，如果有则允许 LLM 修正参数重试
+                failed_tools = [tr for tr in tool_results if isinstance(tr.get("result"), dict) and not tr["result"].get("success", True)]
+                if failed_tools and round_idx < max_tool_rounds:
+                    # 有工具失败且还有重试机会，引导 LLM 修正参数重试
+                    failed_text = "\n".join(
+                        f"工具 {tr['tool']} 失败: {tr['result'].get('error', '未知错误')}"
+                        for tr in failed_tools
+                    )
+                    current_messages.append({
+                        "role": "user",
+                        "content": (
+                            f"工具调用结果如下：{results_text}\n\n"
+                            f"⚠️ 以下工具调用失败：\n{failed_text}\n\n"
+                            f"请检查失败原因并修正参数后重新调用工具。"
+                            f"常见问题：数组类型参数应直接写 JSON 数组（如 [\"web\"]）而非字符串；"
+                            f"如果参数格式没问题，可以换一种方式调用或基于已有信息回答。"
+                        )
+                    })
+                    logger.info(f"工具调用失败，引导 LLM 修正参数重试 (round={round_idx+1})")
+                else:
+                    # 无失败或已到最大轮次，直接回答
+                    current_messages.append({
+                        "role": "user",
+                        "content": (
+                            f"工具调用结果如下：{results_text}\n\n"
+                            f"请基于以上工具返回的实时数据，用自然语言回答用户的问题。"
+                            f"直接给出最终回答。"
+                        )
+                    })
+
+    async def _observe_and_reflect(
+        self,
+        tool_results: List[Dict[str, Any]],
+        tool_execution_context: Dict[str, Any],
+        round_idx: int,
+    ) -> Optional[Dict[str, Any]]:
+        """阶段三：Observe + Reflect
+
+        1. 从 rag_retrieve 结果中提取证据（Observe）
+        2. 调用 EvidenceVerifier 验证证据相关性
+        3. 调用 Reflector 判断是否充分，决定下一步
+
+        Returns:
+            Reflection 字典（sufficient, gaps, next_action, next_query, ...）
+            若无 rag_retrieve 调用则返回 None
+        """
+        retrieval_ctx = tool_execution_context.get("retrieval_context") or {}
+
+        # 只对 rag_retrieve 工具做反思
+        rag_results = [tr for tr in tool_results if tr.get("tool") == "rag_retrieve"]
+        if not rag_results:
+            return None
+
+        try:
+            from services.evidence_verifier import evidence_verifier, reflector
+
+            # —— Observe：收集本轮证据 ——
+            all_chunks = []
+            original_query = ""
+            for tr in rag_results:
+                result = tr.get("result") or {}
+                if result.get("error"):
+                    continue
+                chunks = result.get("chunks", [])
+                query = result.get("query", "")
+                if not original_query:
+                    original_query = query
+                all_chunks.extend(chunks)
+
+            if not all_chunks:
+                # 检索无结果，证据不足
+                obs_list = retrieval_ctx.setdefault("observations", [])
+                obs_list.append({
+                    "round": round_idx,
+                    "query": original_query,
+                    "evidence_count": 0,
+                    "top_score": 0.0,
+                })
+                return {
+                    "sufficient": False,
+                    "gaps": ["检索无结果"],
+                    "next_action": "retrieve_more",
+                    "next_query": original_query,
+                    "reason": "检索返回 0 条结果",
+                    "verified_count": 0,
+                    "source": "rules",
+                    "original_query": original_query,
+                }
+
+            # —— Verify：证据验证 ——
+            verified_chunks = await evidence_verifier.verify(original_query, all_chunks)
+            verified_count = sum(1 for c in verified_chunks if c.get("verified"))
+            top_score = max((c.get("score", 0) for c in all_chunks), default=0.0)
+
+            # 收集验证后的证据到 tool_execution_context（供 Agent 层回收）
+            collected_evidence = retrieval_ctx.setdefault("collected_evidence", [])
+            for chunk in verified_chunks:
+                collected_evidence.append({
+                    **chunk,
+                    "retrieved_at_round": round_idx,
+                    "query": original_query,
+                })
+
+            # 记录观察
+            obs_list = retrieval_ctx.setdefault("observations", [])
+            obs_list.append({
+                "round": round_idx,
+                "query": original_query,
+                "evidence_count": len(all_chunks),
+                "top_score": top_score,
+                "verified_count": verified_count,
             })
+
+            # —— Reflect：反思充分性 ——
+            reflection = await reflector.reflect(
+                query=original_query,
+                observations=obs_list,
+                verified_count=len({c.get("chunk_id") for c in collected_evidence if c.get("verified")}),
+                total_retrieval_count=retrieval_ctx.get("total_retrieval_count", 0),
+                max_retrievals=retrieval_ctx.get("max_retrievals", 5),
+            )
+            reflection["original_query"] = original_query
+
+            logger.info(
+                f"阶段三反思 (round={round_idx}): sufficient={reflection.get('sufficient')}, "
+                f"verified={reflection.get('verified_count')}, "
+                f"next_action={reflection.get('next_action')}, "
+                f"source={reflection.get('source')}"
+            )
+            return reflection
+
+        except Exception as e:
+            logger.warning(f"阶段三 Observe+Reflect 异常: {e}，跳过反思")
+            return None
 
     async def _generate_once(self, messages: List[Dict[str, str]]) -> str:
         """非流式生成"""

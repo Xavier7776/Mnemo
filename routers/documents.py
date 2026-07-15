@@ -994,6 +994,158 @@ async def upload_document(
         )
 
 
+@router.post("/upload-batch")
+async def upload_documents_batch(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+    assistant_id: Optional[str] = Form(None),
+    knowledge_space_id: Optional[str] = Form(None),
+):
+    """
+    批量上传文档（匿名模式）
+
+    支持多文件同时上传，每个文件独立处理，部分失败不影响其他文件。
+    """
+    import hashlib
+
+    if not files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="未提供任何文件"
+        )
+
+    allowed_extensions = {
+        ".pdf", ".docx", ".doc", ".md", ".txt", ".markdown",
+        ".pptx", ".xlsx", ".xls", ".html", ".htm",
+        ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif",
+    }
+
+    doc_repo = get_document_repo()
+    MAX_FILE_SIZE = 200 * 1024 * 1024  # 200MB
+
+    # 知识空间 ID 向后兼容
+    if not knowledge_space_id and assistant_id:
+        knowledge_space_id = assistant_id
+
+    results = []
+    success_count = 0
+    failed_count = 0
+    duplicated_count = 0
+
+    for file in files:
+        filename = file.filename or "unknown"
+        file_ext = os.path.splitext(filename)[1].lower()
+
+        try:
+            # 检查文件类型
+            if file_ext not in allowed_extensions:
+                results.append({
+                    "filename": filename,
+                    "status": "failed",
+                    "error": f"不支持的文件类型: {file_ext}"
+                })
+                failed_count += 1
+                continue
+
+            # 读取文件内容（流式，1MB chunks）
+            file_content = b""
+            file_size = 0
+            too_large = False
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                file_size += len(chunk)
+                if file_size > MAX_FILE_SIZE:
+                    too_large = True
+                    break
+                file_content += chunk
+
+            if too_large:
+                results.append({
+                    "filename": filename,
+                    "status": "failed",
+                    "error": "文件大小超过200MB"
+                })
+                failed_count += 1
+                continue
+
+            if file_size == 0:
+                results.append({
+                    "filename": filename,
+                    "status": "failed",
+                    "error": "文件不能为空"
+                })
+                failed_count += 1
+                continue
+
+            # 计算哈希
+            file_hash = hashlib.sha256(file_content).hexdigest()
+
+            # 重复检测
+            duplicate_doc = doc_repo.find_duplicate_by_hash(file_hash)
+            if duplicate_doc:
+                duplicate_title = duplicate_doc.get("title") or filename
+                results.append({
+                    "filename": filename,
+                    "status": "duplicated",
+                    "error": f"文档内容已存在: {duplicate_title}"
+                })
+                duplicated_count += 1
+                continue
+
+            # 保存文件
+            file_path = os.path.join(UPLOAD_DIR, filename)
+            with open(file_path, "wb") as buffer:
+                buffer.write(file_content)
+
+            file_size = os.path.getsize(file_path)
+
+            # 创建文档记录
+            doc_id = doc_repo.create_document(
+                title=filename,
+                file_type=file_ext[1:],
+                file_path=file_path,
+                file_size=file_size,
+                file_hash=file_hash,
+                assistant_id=assistant_id,
+                knowledge_space_id=knowledge_space_id,
+            )
+
+            doc_repo.update_document_status(doc_id, "processing")
+            background_tasks.add_task(process_document_background, file_path, doc_id, assistant_id, knowledge_space_id)
+
+            logger.info(f"[批量上传] 文件上传成功 - 文档ID: {doc_id}, 文件名: {filename}")
+
+            results.append({
+                "filename": filename,
+                "status": "success",
+                "document_id": doc_id,
+                "file_size": file_size,
+            })
+            success_count += 1
+
+        except Exception as e:
+            logger.error(f"[批量上传] 文件处理失败 - 文件名: {filename}, 错误: {str(e)}")
+            results.append({
+                "filename": filename,
+                "status": "failed",
+                "error": str(e)
+            })
+            failed_count += 1
+
+    logger.info(f"[批量上传] 完成 - 总计: {len(files)}, 成功: {success_count}, 失败: {failed_count}, 重复: {duplicated_count}")
+
+    return {
+        "message": f"批量上传完成: {success_count} 成功, {failed_count} 失败, {duplicated_count} 重复",
+        "total": len(files),
+        "success": success_count,
+        "failed": failed_count,
+        "duplicated": duplicated_count,
+        "results": results,
+    }
+
+
 class DocumentInfo(BaseModel):
     """文档信息模型"""
     id: str
@@ -1058,7 +1210,8 @@ async def list_documents(
                     status=doc.get("status", "unknown"),
                     progress_percentage=doc.get("progress_percentage"),
                     current_stage=doc.get("current_stage"),
-                    stage_details=doc.get("stage_details")
+                    stage_details=doc.get("stage_details"),
+                    knowledge_space_id=doc.get("knowledge_space_id")
                 )
                 document_list.append(document_info)
             except Exception as e:

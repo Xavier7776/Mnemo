@@ -2,7 +2,6 @@
 # 保持向后兼容，导出原有模块
 from .base import BaseChunker
 from .simple_chunker import SimpleChunker
-from .sliding_window_chunker import SlidingWindowChunker
 from .smart_chunker import SmartChunker
 from .report_chunker import ReportChunker
 
@@ -14,9 +13,8 @@ try:
     __all__ = [
         "BaseChunker",
         "SimpleChunker",
-        "SlidingWindowChunker",
         "SmartChunker",
-            "ReportChunker",
+        "ReportChunker",
         "ContentAnalyzer",
         "RecursiveChunker",
         "SemanticChunker"
@@ -26,8 +24,7 @@ except ImportError:
     __all__ = [
         "BaseChunker",
         "SimpleChunker",
-        "SlidingWindowChunker",
-            "SmartChunker",
-            "ReportChunker"
+        "SmartChunker",
+        "ReportChunker"
     ]
 

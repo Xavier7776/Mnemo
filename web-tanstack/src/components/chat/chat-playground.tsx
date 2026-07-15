@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { Bot, ChevronLeft, Check, Copy, Cpu, Plus, SendHorizontal, Square, Trash2, User, Wrench, ChevronDown, ChevronRight } from "lucide-react"
+import { Bot, Brain, ChevronLeft, Check, Copy, Cpu, Plus, SendHorizontal, Square, Trash2, User, Wrench, ChevronDown, ChevronRight } from "lucide-react"
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { Button } from "@/components/ui/button"
@@ -13,11 +13,15 @@ import type {
   ConversationDetail,
   ConversationMessage,
   MessageAddRequest,
+  RetrievalEvidence,
+  RagTrace,
   SourceInfo,
   StoredMessage,
   ToolCallEvent,
   ToolCallInfo,
 } from "@/types/api"
+import { TracePanel } from "@/components/chat/trace-panel"
+import { EvidenceList } from "@/components/chat/evidence-list"
 
 const SourceList = memo(function SourceList({ sources }: { sources: SourceInfo[] }) {
   if (sources.length === 0) {
@@ -49,7 +53,7 @@ const SourceList = memo(function SourceList({ sources }: { sources: SourceInfo[]
   )
 })
 
-const ToolCallItem = memo(function ToolCallItem({ tool, round }: { tool: ToolCallInfo; round: number }) {
+const ToolCallItem = memo(function ToolCallItem({ tool }: { tool: ToolCallInfo; round: number }) {
   const [expanded, setExpanded] = useState(false)
   return (
     <div className="rounded-lg border border-neutral-200 bg-white">
@@ -107,30 +111,72 @@ const ToolCallItem = memo(function ToolCallItem({ tool, round }: { tool: ToolCal
 })
 
 const ToolCallChain = memo(function ToolCallChain({ toolCalls }: { toolCalls: ToolCallEvent[] }) {
+  const [expanded, setExpanded] = useState(false)
   if (toolCalls.length === 0) {
     return null
   }
   const totalTools = toolCalls.reduce((sum, tc) => sum + tc.tools.length, 0)
   return (
     <div className="mb-3 space-y-2">
-      <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-slate-500">
+      <button
+        type="button"
+        className="flex w-full items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-slate-500 transition-colors hover:text-slate-700"
+        onClick={() => setExpanded(!expanded)}
+      >
         <Wrench className="size-3.5" />
         <span>工具调用 · {toolCalls.length} 轮 · {totalTools} 次</span>
-      </div>
-      <div className="space-y-2">
-        {toolCalls.map((tc, idx) => (
-          <div key={idx} className="space-y-1.5">
-            <div className="text-[10px] font-medium text-neutral-500 pl-1">
-              第 {tc.round} 轮
+        {expanded ? (
+          <ChevronDown className="size-3.5 shrink-0" />
+        ) : (
+          <ChevronRight className="size-3.5 shrink-0" />
+        )}
+      </button>
+      {expanded ? (
+        <div className="space-y-2">
+          {toolCalls.map((tc, idx) => (
+            <div key={idx} className="space-y-1.5">
+              <div className="text-[10px] font-medium text-neutral-500 pl-1">
+                第 {tc.round} 轮
+              </div>
+              <div className="space-y-1.5">
+                {tc.tools.map((tool, tIdx) => (
+                  <ToolCallItem key={tIdx} tool={tool} round={tc.round} />
+                ))}
+              </div>
             </div>
-            <div className="space-y-1.5">
-              {tc.tools.map((tool, tIdx) => (
-                <ToolCallItem key={tIdx} tool={tool} round={tc.round} />
-              ))}
-            </div>
-          </div>
-        ))}
-      </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+})
+
+/** 思考过程面板 — 默认折叠，点击展开 */
+const ThinkingPanel = memo(function ThinkingPanel({ thinking }: { thinking: string }) {
+  const [expanded, setExpanded] = useState(false)
+  if (!thinking.trim()) return null
+  return (
+    <div className="mb-3 space-y-1">
+      <button
+        type="button"
+        className="flex w-full items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-slate-400 transition-colors hover:text-slate-600"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <Brain className="size-3.5" />
+        <span>思考过程</span>
+        {expanded ? (
+          <ChevronDown className="size-3.5 shrink-0" />
+        ) : (
+          <ChevronRight className="size-3.5 shrink-0" />
+        )}
+      </button>
+      {expanded ? (
+        <div className="rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
+          <pre className="whitespace-pre-wrap break-words text-[11px] leading-5 text-slate-600">
+{thinking}
+          </pre>
+        </div>
+      ) : null}
     </div>
   )
 })
@@ -168,9 +214,11 @@ const CopyButton = memo(function CopyButton({ text }: { text: string }) {
 const MessageBubble = memo(function MessageBubble({
   message,
   toolCalls,
+  thinking,
 }: {
   message: ConversationMessage
   toolCalls?: ToolCallEvent[]
+  thinking?: string
 }) {
   const isUser = message.role === "user"
   const cleanedContent = isUser ? message.content : stripToolCalls(message.content)
@@ -189,6 +237,9 @@ const MessageBubble = memo(function MessageBubble({
             : "border border-[var(--blue-line)] bg-white text-neutral-800",
         )}
       >
+        {!isUser && thinking ? (
+          <ThinkingPanel thinking={thinking} />
+        ) : null}
         {!isUser && toolCalls && toolCalls.length > 0 ? (
           <ToolCallChain toolCalls={toolCalls} />
         ) : null}
@@ -206,6 +257,8 @@ const MessageBubble = memo(function MessageBubble({
           {!isUser && cleanedContent ? <CopyButton text={cleanedContent} /> : null}
         </div>
         {message.sources?.length ? <SourceList sources={message.sources} /> : null}
+        {message.evidence?.length ? <EvidenceList evidence={message.evidence} /> : null}
+        {message.trace ? <TracePanel trace={message.trace} /> : null}
       </div>
     </div>
   )
@@ -221,6 +274,7 @@ export function ChatPlayground() {
   const [streaming, setStreaming] = useState(false)
   const [streamError, setStreamError] = useState<string | null>(null)
   const [draftToolCalls, setDraftToolCalls] = useState<ToolCallEvent[]>([])
+  const [draftThinking, setDraftThinking] = useState("")
   const abortRef = useRef<AbortController | null>(null)
   const messageListRef = useRef<HTMLDivElement>(null)
   const draftTimestampRef = useRef<string>("")
@@ -332,6 +386,11 @@ export function ChatPlayground() {
         timestamp: msg.timestamp,
         sources: msg.sources,
         recommended_resources: msg.recommended_resources,
+        // 阶段三：传递 trace/evidence/tool_calls
+        trace: msg.trace,
+        evidence: msg.evidence,
+        tool_calls: msg.tool_calls,
+        thinking: msg.thinking,
       }))
     : [], [activeConversationId, detailQuery.data])
   const isLoadingHistory = !!activeConversationId && detailQuery.isPending
@@ -374,15 +433,20 @@ export function ChatPlayground() {
       setDraftAnswer("")
       setStreamError(null)
       setDraftToolCalls([])
+      setDraftThinking("")
       setStreaming(true)
 
       const controller = new AbortController()
       abortRef.current = controller
 
       let assistantText = ""
+      let thinkingText = ""
       let collectedSources: SourceInfo[] = []
       let collectedError: string | null = null
       let collectedToolCalls: ToolCallEvent[] = []
+      // 阶段三：trace 和 evidence 捕获
+      let collectedTrace: RagTrace | undefined = undefined
+      let collectedEvidence: RetrievalEvidence[] = []
 
       try {
         await api.sendChatStream(
@@ -393,14 +457,26 @@ export function ChatPlayground() {
               setStreamError(event.error)
               return
             }
-            if (event.tool_call) {
+            if (event.thinking) {
+              thinkingText += event.thinking
+              setDraftThinking(thinkingText)
+            } else if (event.tool_call) {
               collectedToolCalls = [...collectedToolCalls, event.tool_call]
               setDraftToolCalls(collectedToolCalls)
             } else if (event.content) {
               assistantText += event.content
               setDraftAnswer(assistantText)
-            } else if (event.done && event.sources) {
-              collectedSources = event.sources
+            } else if (event.done) {
+              // 阶段三：complete 事件捕获 sources/trace/evidence
+              if (event.sources) {
+                collectedSources = event.sources
+              }
+              if (event.trace) {
+                collectedTrace = event.trace
+              }
+              if (event.evidence) {
+                collectedEvidence = event.evidence
+              }
             }
           },
           controller.signal,
@@ -421,6 +497,11 @@ export function ChatPlayground() {
             (collectedError ? `请求失败：${collectedError}` : "（无内容）"),
           timestamp: new Date().toISOString(),
           sources: collectedSources.length ? collectedSources : undefined,
+          // 阶段三：持久化 trace/evidence/tool_calls
+          trace: collectedTrace,
+          evidence: collectedEvidence.length ? collectedEvidence : undefined,
+          tool_calls: collectedToolCalls.length ? collectedToolCalls : undefined,
+          thinking: thinkingText || undefined,
         }
         // 乐观更新：追加助手回复到详情缓存
         queryClient.setQueryData<ConversationDetail>(["conversation", cid], (old) => {
@@ -433,6 +514,7 @@ export function ChatPlayground() {
         })
         setDraftAnswer("")
         setDraftToolCalls([])
+        setDraftThinking("")
         abortRef.current = null
 
         // 持久化到服务端：必须串行，先 user 后 assistant，保证 MongoDB $push 顺序正确
@@ -449,6 +531,11 @@ export function ChatPlayground() {
           role: "assistant",
           content: finalAssistant.content,
           sources: collectedSources.length ? collectedSources : undefined,
+          // 阶段三：持久化到服务端
+          trace: collectedTrace,
+          evidence: collectedEvidence.length ? collectedEvidence : undefined,
+          tool_calls: collectedToolCalls.length ? collectedToolCalls : undefined,
+          thinking: thinkingText || undefined,
         }
         const assistantRes = await api.addMessage(cid, assistantPayload)
         if (assistantRes.error) {
@@ -480,13 +567,6 @@ export function ChatPlayground() {
     }
   }
 
-  const handleRefreshHistory = async () => {
-    if (!activeConversationId) {
-      return
-    }
-    await queryClient.invalidateQueries({ queryKey: ["conversation", activeConversationId] })
-  }
-
   const errors = [
     conversationsQuery.error instanceof Error && !conversationsQuery.isPending
       ? `会话列表加载失败：${conversationsQuery.error.message}` : null,
@@ -498,15 +578,23 @@ export function ChatPlayground() {
 
   const cleanedDraft = useMemo(() => stripToolCalls(draftAnswer), [draftAnswer])
 
+  // 阶段三：draft 期间也展示 trace/evidence（从 ref 获取，避免重渲染）
+  const draftTraceRef = useRef<RagTrace | undefined>(undefined)
+  const draftEvidenceRef = useRef<RetrievalEvidence[]>([])
+
   const allMessages = useMemo<ConversationMessage[]>(
     () => (draftAnswer.length > 0 || draftToolCalls.length > 0
       ? [...messages, {
           role: "assistant" as const,
           content: cleanedDraft,
           timestamp: draftTimestampRef.current,
+          trace: draftTraceRef.current,
+          evidence: draftEvidenceRef.current.length > 0 ? draftEvidenceRef.current : undefined,
+          tool_calls: draftToolCalls.length > 0 ? draftToolCalls : undefined,
+          thinking: draftThinking || undefined,
         }]
       : messages),
-    [messages, cleanedDraft, draftAnswer, draftToolCalls],
+    [messages, cleanedDraft, draftAnswer, draftToolCalls, draftThinking],
   )
 
   return (
@@ -593,7 +681,7 @@ export function ChatPlayground() {
       <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
         {/* 消息列表区 - 自适应高度，底部留出悬浮输入框空间 */}
         <div
-          className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 pb-32 pt-2"
+          className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 pb-4 pt-2"
           ref={messageListRef}
           onScroll={handleScroll}
         >
@@ -622,7 +710,8 @@ export function ChatPlayground() {
                   <MessageBubble
                     key={`${message.role}-${index}-${message.timestamp ?? ""}`}
                     message={message}
-                    toolCalls={showToolCalls ? draftToolCalls : undefined}
+                    toolCalls={showToolCalls ? draftToolCalls : message.tool_calls}
+                    thinking={showToolCalls ? draftThinking : message.thinking}
                   />
                 )
               })}
@@ -653,9 +742,9 @@ export function ChatPlayground() {
           ) : null}
         </div>
 
-        {/* 悬浮输入区 - 无边框，圆角胶囊，悬浮在内容上方 */}
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 px-4 pb-4">
-          <div className="pointer-events-auto mx-auto max-w-3xl rounded-[1.5rem] bg-white shadow-[0_2px_24px_rgba(0,0,0,0.06)] ring-1 ring-neutral-200/60 transition-shadow focus-within:ring-neutral-300/80 focus-within:shadow-[0_4px_32px_rgba(0,0,0,0.08)]">
+        {/* 输入区 - 正常文档流，圆角胶囊 */}
+        <div className="shrink-0 px-4 pb-4 pt-2">
+          <div className="mx-auto max-w-3xl rounded-[1.5rem] bg-white shadow-[0_2px_24px_rgba(0,0,0,0.06)] ring-1 ring-neutral-200/60 transition-shadow focus-within:ring-neutral-300/80 focus-within:shadow-[0_4px_32px_rgba(0,0,0,0.08)]">
             <div className="flex items-end gap-2 p-2.5">
               <Textarea
                 placeholder="输入问题，Enter 发送，Shift+Enter 换行"

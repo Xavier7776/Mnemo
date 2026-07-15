@@ -193,6 +193,51 @@ class AITools:
             },
             function=self._conversation_search,
         )
+
+        # 工具10: rag_retrieve（Agentic RAG 自适应检索工具）
+        # 该工具让 Agent 在生成过程中主动决定是否检索、检索什么、用什么策略
+        # 真正的 async 实现是 rag_retrieve_with_context，由 llm_service 直接调用（不走 async_call_tool）
+        self.register_tool(
+            name="rag_retrieve",
+            description=(
+                "从知识库检索与查询相关的文档片段。当用户问题涉及具体事实、技术细节、"
+                "或需要引用文档内容时调用此工具。可指定检索策略：\n"
+                "- 'auto'（默认）：自动选择向量+BM25+图谱混合检索\n"
+                "- 'vector'：仅向量语义检索，适合模糊/概念性查询\n"
+                "- 'keyword'：仅关键词检索，适合专有名词/代码/ID\n"
+                "- 'graph'：仅图谱检索，适合关系/路径查询\n"
+                "可多次调用以迭代补充上下文，系统会自动去重。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "检索查询语句。应聚焦于具体信息需求，避免复述整个用户问题。"
+                    },
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["auto", "vector", "keyword", "graph"],
+                        "default": "auto",
+                        "description": "检索策略"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "返回的文档片段数量"
+                    },
+                    "min_score": {
+                        "type": "number",
+                        "default": 0.3,
+                        "description": "相关性阈值，低于此分数的结果将被过滤"
+                    },
+                },
+                "required": ["query"]
+            },
+            function=self._rag_retrieve_sync_placeholder,
+        )
     
     def register_tool(
         self,
@@ -329,7 +374,147 @@ class AITools:
         except Exception as e:
             logger.error(f"调用工具函数 {name} 失败: {str(e)}", exc_info=True)
             raise
-    
+
+    def register_mcp_tools(self, manager) -> int:
+        """将 MCP Server 的工具动态注册为 ai_tools
+
+        Args:
+            manager: MCPClientManager 实例
+
+        Returns:
+            注册的工具数量
+        """
+        if not manager.is_enabled:
+            logger.info("MCP 未启用或未初始化，跳过 MCP 工具注册")
+            return 0
+
+        tool_map = manager.get_tool_map()
+        all_tools = manager.get_all_tools()
+        registered = 0
+
+        for tool_schema in all_tools:
+            tool_name = tool_schema["name"]
+            server_name, original_name = tool_map[tool_name]
+
+            # 为每个 MCP 工具生成 async wrapper
+            wrapper = self._make_mcp_tool_wrapper(manager, server_name, original_name)
+
+            self.register_tool(
+                name=tool_name,
+                description=tool_schema["description"],
+                parameters=tool_schema["parameters"],
+                function=wrapper,
+            )
+            # 注册到 async_tools 字典，确保 async_call_tool 走 await 分支
+            # 触发懒加载，确保 _async_tools 字典已初始化
+            self._get_async_tools()
+            self._async_tools[tool_name] = wrapper
+            registered += 1
+
+        logger.info(f"MCP 工具注册完成: {registered} 个工具")
+        return registered
+
+    @staticmethod
+    def _make_mcp_tool_wrapper(manager, server_name: str, tool_name: str):
+        """为 MCP 工具生成 async wrapper
+
+        Args:
+            manager: MCPClientManager 实例
+            server_name: MCP Server 名称
+            tool_name: 工具名称（不含前缀）
+
+        Returns:
+            async 可调用对象
+        """
+        async def wrapper(**kwargs):
+            result = await manager.call_tool(server_name, tool_name, kwargs)
+            # 返回格式与内置工具保持一致
+            if result.get("success"):
+                return {"success": True, "result": result.get("result")}
+            else:
+                return {"success": False, "error": result.get("error", "未知错误")}
+        return wrapper
+
+    def _rag_retrieve_sync_placeholder(self, **kwargs):
+        """rag_retrieve 的同步占位：真正的 async 实现是 rag_retrieve_with_context，
+        由 llm_service._generate_stream 直接调用，不经过 async_call_tool。
+        若被误调用（如通过 call_tool），返回提示信息。"""
+        return {
+            "error": "rag_retrieve 必须通过 Agent 工具调用循环异步调用，不支持同步调用",
+            "hint": "请确保通过 llm_service._generate_stream 中的工具调用循环触发"
+        }
+
+    async def rag_retrieve_with_context(
+        self,
+        query: str,
+        strategy: str = "auto",
+        top_k: int = 5,
+        min_score: float = 0.3,
+        document_id: Optional[str] = None,
+        assistant_id: Optional[str] = None,
+        knowledge_space_ids: Optional[list] = None,
+        embedding_model: Optional[str] = None,
+        exclude_chunk_ids: Optional[set] = None,
+    ) -> Dict[str, Any]:
+        """
+        rag_retrieve 工具的真正 async 实现，由 llm_service 直接调用。
+        调用 rag_service.retrieve_context 执行检索，返回精简结构给 Agent。
+
+        Args:
+            query: 检索查询
+            strategy: 检索策略（auto/vector/keyword/graph）
+            top_k: 返回片段数
+            min_score: 相关性阈值
+            document_id: 文档ID过滤（系统注入）
+            assistant_id: 助手ID（系统注入）
+            knowledge_space_ids: 知识空间ID列表（系统注入）
+            embedding_model: 向量模型名（系统注入）
+            exclude_chunk_ids: 需排除的chunk_id集合（系统注入，跨轮次去重）
+        """
+        from services.rag_service import rag_service
+
+        try:
+            result = await rag_service.retrieve_context(
+                query=query,
+                document_id=document_id,
+                assistant_id=assistant_id,
+                knowledge_space_ids=knowledge_space_ids,
+                embedding_model=embedding_model,
+                strategy=strategy,
+                top_k=top_k,
+                min_score=min_score,
+                exclude_chunk_ids=exclude_chunk_ids,
+            )
+
+            evidence = result.get("evidence", [])
+            # 返回给 Agent 的精简结构（控制 token 预算）
+            # 阶段三：新增 document_id 字段（供 Agent 层 sources 回收）
+            return {
+                "query": query,
+                "strategy": strategy,
+                "chunks": [
+                    {
+                        "content": item.get("text", "")[:800],
+                        "score": round(item.get("score", 0), 3),
+                        "document_title": item.get("document_title", ""),
+                        "document_id": item.get("document_id", ""),
+                        "chunk_id": item.get("chunk_id", ""),
+                        "section_path": item.get("section_path", []),
+                    }
+                    for item in evidence
+                ],
+                "total_found": len(evidence),
+                "context": result.get("context", "")[:2000],
+            }
+        except Exception as e:
+            logger.error(f"rag_retrieve_with_context 失败: {str(e)}", exc_info=True)
+            return {
+                "error": f"检索失败: {str(e)}",
+                "query": query,
+                "chunks": [],
+                "total_found": 0,
+            }
+
     def _get_available_ollama_models(self) -> Dict[str, Any]:
         """获取当前使用的模型信息"""
         try:

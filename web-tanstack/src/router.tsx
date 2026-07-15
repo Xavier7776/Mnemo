@@ -10,6 +10,9 @@ const ChatPlayground = lazy(() =>
 const DocumentsTable = lazy(() =>
   import("@/components/documents/documents-table").then((module) => ({ default: module.DocumentsTable })),
 )
+const McpManager = lazy(() =>
+  import("@/components/mcp/mcp-manager").then((module) => ({ default: module.McpManager })),
+)
 const RetrievalSearch = lazy(() =>
   import("@/components/retrieval/retrieval-search").then((module) => ({ default: module.RetrievalSearch })),
 )
@@ -64,7 +67,17 @@ const retrievalRoute = createRoute({
   ),
 })
 
-const routeTree = rootRoute.addChildren([indexRoute, chatRoute, documentsRoute, retrievalRoute])
+const mcpRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/mcp",
+  component: () => (
+    <Suspense fallback={<RouteFallback />}>
+      <McpManager />
+    </Suspense>
+  ),
+})
+
+const routeTree = rootRoute.addChildren([indexRoute, chatRoute, documentsRoute, retrievalRoute, mcpRoute])
 
 export const router = createRouter({
   routeTree,

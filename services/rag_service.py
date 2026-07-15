@@ -43,10 +43,14 @@ class RAGService:
         conversation_id: Optional[str] = None,
         knowledge_space_ids: Optional[list[str]] = None,
         embedding_model: Optional[str] = None,
+        strategy: str = "auto",
+        top_k: Optional[int] = None,
+        min_score: Optional[float] = None,
+        exclude_chunk_ids: Optional[set] = None,
     ) -> Dict[str, Any]:
         """
         检索相关上下文（并行检索文档和资源）
-        
+
         Args:
             query: 用户查询
             document_id: 可选的文档ID过滤
@@ -54,7 +58,11 @@ class RAGService:
             collection_name: 可选的集合名称（如果提供则直接使用）
             conversation_id: 可选的对话ID（如果提供，会同时检索对话专用向量空间）
             embedding_model: 可选的向量模型名称
-        
+            strategy: 检索策略（auto/vector/keyword/graph），默认 auto 走完整混合流水线
+            top_k: 覆盖 query_planner 的 final_k（若提供）
+            min_score: 覆盖默认的 score_threshold（若提供）
+            exclude_chunk_ids: 需排除的 chunk_id 集合（Agent 跨轮次去重）
+
         Returns:
             包含上下文、来源信息和推荐资源的字典
         """
@@ -72,13 +80,9 @@ class RAGService:
             modules = {}
             params = {}
             rerank_enabled = True
-        # query_planner
-        # 就是一个基于关键词的规则引擎，用简单的 if -any - keyword - in -query
-        # 判断意图，决定检索参数要不要调大、query
-        # 要不要扩写。不调
-        # LLM，不耗钱，微秒级返回。
+        # query_planner（阶段二：LLM 驱动 + 规则 fallback）
         from services.query_planner import query_planner
-        plan = query_planner.build_plan(
+        plan = await query_planner.build_plan(
             query,
             runtime_modules=modules,
             runtime_params=params,
@@ -121,41 +125,38 @@ class RAGService:
             collection_names = [collection_name or "default_knowledge"]
         
         # 并行检索文档和资源
-        loop = asyncio.get_event_loop()
-        
-        # 文档检索任务（知识空间集合，可多集合并行）
+        # 阶段二：通过 RetrievalContextManager 编排（支持查询分解）
         from retrieval.rag_retriever import RAGRetriever
+        from services.retrieval_context_manager import retrieval_context_manager
+        # 工具调用时允许覆盖 final_k / score_threshold
+        effective_final_k = top_k if top_k is not None else plan.final_k
+        effective_score_threshold = min_score if min_score is not None else 0.7
         doc_retriever = RAGRetriever(
-            final_k=plan.final_k,
+            final_k=effective_final_k,
             prefetch_k=plan.prefetch_k,
-            score_threshold=0.7,
+            score_threshold=effective_score_threshold,
             enable_reranker=rerank_enabled,
             fusion_strategy=plan.fusion_strategy,
         )
-        
-        # 使用异步检索方法 (retrieve_async)
-        doc_tasks = [
-            doc_retriever.retrieve_async(
-                query,
-                document_id,
-                cn,
-                embedding_model=embedding_model,
-                query_variants=plan.rewritten_queries,
-                graph_enabled=plan.need_graph,
-            )
-            for cn in collection_names
-        ]
-        
-        # 等待文档检索完成并合并
-        results_list = await asyncio.gather(*doc_tasks) if doc_tasks else [[]]
-        results = []
-        for part in results_list:
-            results.extend(part or [])
+
+        # 通过 RetrievalContextManager 编排检索（单查询或查询分解）
+        results = await retrieval_context_manager.orchestrate(
+            retriever=doc_retriever,
+            query=query,
+            plan=plan,
+            collection_names=collection_names,
+            document_id=document_id,
+            embedding_model=embedding_model,
+            strategy=strategy,
+            exclude_chunk_ids=exclude_chunk_ids,
+        )
         trace["retrieval"] = {
             "collection_count": len(collection_names),
             "result_count": len(results),
             "fusion_strategy": plan.fusion_strategy,
             "rewritten_queries": plan.rewritten_queries,
+            "sub_queries": plan.sub_queries,
+            "planner_source": plan.planner_source,
         }
         logger.info(f"知识空间检索完成 - 集合数: {len(collection_names)}, 结果数: {len(results)}")
         logger.info(f"RAG检索完成 - 文档结果: {len(results)} 个")
@@ -205,8 +206,7 @@ class RAGService:
                             pass
 
                     if doc_ids_obj:
-                        # 在线程池中执行同步 MongoDB 查询
-                        import asyncio
+                        # 在线程池中执行同步 MongoDB 查询（asyncio 已在模块顶部导入）
                         def _batch_get_docs():
                             return list(doc_repo.collection.find({"_id": {"$in": doc_ids_obj}}))
                         docs = await asyncio.to_thread(_batch_get_docs)
@@ -260,15 +260,14 @@ class RAGService:
                     neighbor_prefetch_map[chunk_id] = None  # 占位
 
         if neighbor_prefetch_keys:
-            import asyncio as _asyncio
             def _get_neighbors(doc_id, chunk_index):
                 return chunk_repo.get_neighbor_chunks(doc_id, chunk_index, window=neighbor_window)
-            # 并发查询所有邻居
+            # 并发查询所有邻居（asyncio 已在模块顶部导入）
             neighbor_tasks = [
-                _asyncio.to_thread(_get_neighbors, did, cidx)
+                asyncio.to_thread(_get_neighbors, did, cidx)
                 for _, did, cidx in neighbor_prefetch_keys
             ]
-            neighbor_results_list = await _asyncio.gather(*neighbor_tasks, return_exceptions=True)
+            neighbor_results_list = await asyncio.gather(*neighbor_tasks, return_exceptions=True)
             for (cid, _, _), nb_result in zip(neighbor_prefetch_keys, neighbor_results_list):
                 if isinstance(nb_result, Exception):
                     neighbor_prefetch_map[cid] = []
