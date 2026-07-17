@@ -1,0 +1,266 @@
+[
+  {
+    "id": "q1",
+    "query": "# Java IO 基础知识总结  ## [IO 流简介](#io-流简介)  IO 即 `Input/Output`，输入和输出。数据输入到计算机内存的过程即输入，反之输出到外部存储（比如数据库，文件，远程主机）的过程即输出。数据传输过程类似于水流，因此称为 IO 流。IO 流在 Java 中分为输入流和输出流，而根据数据的处理方式又分为字节流和字符流。  Java IO 流的 40 多个类都是",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b0",
+      "chunk_indices": [
+        0
+      ],
+      "title": "io.md"
+    }
+  },
+  {
+    "id": "q2",
+    "query": "`FileOutputStream` 是最常用的字节输出流对象，可直接指定文件路径，可以直接输出单字节数据，也可以输出指定的字节数组。  `FileOutputStream` 代码示例：  ```java try (FileOutputStream output = new FileOutputStream(\"output.txt\")) {     byte[] array = \"JavaGuid",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b0",
+      "chunk_indices": [
+        4
+      ],
+      "title": "io.md"
+    }
+  },
+  {
+    "id": "q3",
+    "query": "### [Java SE vs Java EE](#java-se-vs-java-ee)  - Java SE（Java Platform，Standard Edition）: Java 平台标准版，Java 编程语言的基础，它包含了支持 Java 应用程序开发和运行的核心类库以及虚拟机等核心组件。Java SE 可以用于构建桌面应用程序或简单的服务器应用程序。 - Java EE（Java P",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b1",
+      "chunk_indices": [
+        2
+      ],
+      "title": "javamianshi.md"
+    }
+  },
+  {
+    "id": "q4",
+    "query": "### [Java 语言有哪些特点?](#java-语言有哪些特点)  1. 简单易学（语法简单，上手容易）； 2. 面向对象（封装，继承，多态）； 3. 平台无关性（ Java 虚拟机实现平台无关性）； 4. 支持多线程（ C++ 语言没有内置的多线程机制，因此必须调用操作系统的多线程功能来进行多线程程序设计，而 Java 语言却提供了多线程支持）； 5. 可靠性（具备异常处理和自动内存管理机制",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b1",
+      "chunk_indices": [
+        1
+      ],
+      "title": "javamianshi.md"
+    }
+  },
+  {
+    "id": "q5",
+    "query": "### [程序计数器](#程序计数器)  程序计数器是一块较小的内存空间，可以看作是当前线程所执行的字节码的行号指示器。字节码解释器工作时通过改变这个计数器的值来选取下一条需要执行的字节码指令，分支、循环、跳转、异常处理、线程恢复等功能都需要依赖这个计数器来完成。  另外，为了线程切换后能恢复到正确的执行位置，每条线程都需要有一个独立的程序计数器，各线程之间计数器互不影响，独立存储，我们称这类内存",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b2",
+      "chunk_indices": [
+        1
+      ],
+      "title": "jvm.md"
+    }
+  },
+  {
+    "id": "q6",
+    "query": "本地方法被执行的时候，在本地方法栈也会创建一个栈帧，用于存放该本地方法的局部变量表、操作数栈、动态链接、出口信息。  方法执行完毕后相应的栈帧也会出栈并释放内存空间，也会出现 `StackOverFlowError` 和 `OutOfMemoryError` 两种错误。  ### [堆](#堆)  Java 虚拟机所管理的内存中最大的一块，Java 堆是所有线程共享的一块内存区域，在虚拟机启动时创",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b2",
+      "chunk_indices": [
+        4
+      ],
+      "title": "jvm.md"
+    }
+  },
+  {
+    "id": "q7",
+    "query": "# MySQL常见面试题总结  ## [MySQL 基础](#mysql-基础)  ### [什么是关系型数据库？](#什么是关系型数据库)  顾名思义，关系型数据库（RDB，Relational Database）就是一种建立在关系模型的基础上的数据库。关系模型表明了数据库中所存储的数据之间的联系（一对一、一对多、多对多）。  关系型数据库中，我们的数据都被存放在了各种表中（比如用户表），表中的",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b3",
+      "chunk_indices": [
+        0
+      ],
+      "title": "mysql.md"
+    }
+  },
+  {
+    "id": "q8",
+    "query": "例如， TINYINT UNSIGNED 类型的取值范围是 0 ~ 255，而普通的 TINYINT 类型的值范围是 -128 ~ 127。INT UNSIGNED 类型的取值范围是 0 ~ 4,294,967,295，而普通的 INT 类型的值范围是 -2,147,483,648 ~ 2,147,483,647。  对于从 0 开始递增的 ID 列，使用 UNSIGNED 属性可以非常适合，因为",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b3",
+      "chunk_indices": [
+        4
+      ],
+      "title": "mysql.md"
+    }
+  },
+  {
+    "id": "q9",
+    "query": "现在公司一般都是用 Redis 来实现缓存，而且 Redis 自身也越来越强大了！不过，了解 Redis 和 Memcached 的区别和共同点，有助于我们在做相应的技术选型的时候，能够做到有理有据！  **共同点**：  1. 都是基于内存的数据库，一般都用来当做缓存使用。 2. 都有过期策略。 3. 两者的性能都非常高。  **区别**：  1. **数据类型**：Redis 支持更丰富的数据",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b4",
+      "chunk_indices": [
+        4
+      ],
+      "title": "redis.md"
+    }
+  },
+  {
+    "id": "q10",
+    "query": "不过，从 Tendis 这个项目的 Github 提交记录可以看出，Tendis 开源版几乎已经没有被维护更新了，加上其关注度并不高，使用的公司也比较少。因此，不建议你使用 Tendis 来实现分布式缓存。  目前，比较业界认可的 Redis 替代品还是下面这两个开源分布式缓存（都是通过碰瓷 Redis 火的）：  - [Dragonfly](https://github.com/dragonfl",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b4",
+      "chunk_indices": [
+        3
+      ],
+      "title": "redis.md"
+    }
+  },
+  {
+    "id": "q11",
+    "query": "# Spring常见面试题总结  ## [Spring 基础](#spring-基础)  ### [什么是 Spring 框架?](#什么是-spring-框架)  Spring 是一款开源的轻量级 Java 开发框架，旨在提高开发人员的开发效率以及系统的可维护性。  我们一般说 Spring 框架指的都是 Spring Framework，它是很多模块的集合，使用这些模块可以很方便地协助我们进行",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b5",
+      "chunk_indices": [
+        0
+      ],
+      "title": "spring.md"
+    }
+  },
+  {
+    "id": "q12",
+    "query": "Spring MVC 是 Spring 中的一个很重要的模块，主要赋予 Spring 快速构建 MVC 架构的 Web 程序的能力。MVC 是模型(Model)、视图(View)、控制器(Controller)的简写，其核心思想是通过将业务逻辑、数据、显示分离来组织代码。  ![img](https://oss.javaguide.cn/java-guide-blog/image-20210809",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b5",
+      "chunk_indices": [
+        4
+      ],
+      "title": "spring.md"
+    }
+  },
+  {
+    "id": "q13",
+    "query": "## [ThreadLocal](#threadlocal)  ### [ThreadLocal 有什么用？](#threadlocal-有什么用)  通常情况下，我们创建的变量可以被任何一个线程访问和修改。这在多线程环境中可能导致数据竞争和线程安全问题。那么，**如果想让每个线程都有自己的专属本地变量，该如何实现呢？**  JDK 中提供的 `ThreadLocal` 类正是为了解决这个问题。*",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b6",
+      "chunk_indices": [
+        0
+      ],
+      "title": "并发.md"
+    }
+  },
+  {
+    "id": "q14",
+    "query": "//与此线程有关的InheritableThreadLocal值。由InheritableThreadLocal类维护     ThreadLocal.ThreadLocalMap inheritableThreadLocals = null;     //...... } ```  从上面`Thread`类 源代码可以看出`Thread` 类中有一个 `threadLocals` 和 一个 `i",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b6",
+      "chunk_indices": [
+        1
+      ],
+      "title": "并发.md"
+    }
+  },
+  {
+    "id": "q15",
+    "query": "随着分布式和微服务系统的发展，消息队列在系统设计中有了更大的发挥空间，使用消息队列可以降低系统耦合性、实现任务异步、有效地进行流量削峰，是分布式和微服务系统中重要的组件之一。  ## [消息队列有什么用？](#消息队列有什么用)  通常来说，使用消息队列主要能为我们的系统带来下面三点好处：  1. 异步处理 2. 削峰/限流 3. 降低系统耦合性  除了这三点之外，消息队列还有其他的一些应用场景，",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b7",
+      "chunk_indices": [
+        1
+      ],
+      "title": "消息队列.md"
+    }
+  },
+  {
+    "id": "q16",
+    "query": "# 消息队列基础知识总结  ## [什么是消息队列？](#什么是消息队列)  我们可以把消息队列看作是一个存放消息的容器，当我们需要使用消息的时候，直接从容器中取出消息供自己使用即可。由于队列 Queue 是一种先进先出的数据结构，所以消费消息时也是按照顺序来消费的。  ![img](https://oss.javaguide.cn/github/javaguide/high-performanc",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b7",
+      "chunk_indices": [
+        0
+      ],
+      "title": "消息队列.md"
+    }
+  },
+  {
+    "id": "q17",
+    "query": "- **RIP(Routing Information Protocol，路由信息协议）**：一种内部网关协议（Interior Gateway Protocol，IGP），也是一种动态路由协议，基于距离向量算法，使用固定的跳数作为度量标准，选择跳数最少的路径作为最佳路径。 - **BGP（Border Gateway Protocol，边界网关协议）**：一种用来在路由选择域之间交换网络层可达性",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b8",
+      "chunk_indices": [
+        4
+      ],
+      "title": "计算机网络.md"
+    }
+  },
+  {
+    "id": "q18",
+    "query": "### [常见网络协议](#常见网络协议)  #### [⭐️应用层有哪些常见的协议？](#⭐️应用层有哪些常见的协议)  ![应用层常见协议](https://oss.javaguide.cn/github/javaguide/cs-basics/network/application-layer-protocol.png)  - **HTTP（Hypertext Transfer Protoc",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b8",
+      "chunk_indices": [
+        1
+      ],
+      "title": "计算机网络.md"
+    }
+  },
+  {
+    "id": "q19",
+    "query": "---  ## 五、构造 `ToolExecutionManager` 并调用 `execute_tool_async`  ```python tool_execution_manager = ToolExecutionManager(     agent_state=agent_state, message_manager=self.message_manager, agent_manager=",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c16",
+      "chunk_indices": [
+        4
+      ],
+      "title": "_execute_tool详解：工具查找、沙箱环境准备与分层trace打点的编排层.md"
+    }
+  },
+  {
+    "id": "q20",
+    "query": "---  ## 四、准备环境变量（沙箱要用的 secrets）  ```python sandbox_env_vars = {var.key: var.value or \"\" for var in agent_state.secrets} ```  - `agent_state.secrets` 是这个 agent 配置的一批环境变量（`AgentEnvironmentVariable` 对象列表",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c16",
+      "chunk_indices": [
+        3
+      ],
+      "title": "_execute_tool详解：工具查找、沙箱环境准备与分层trace打点的编排层.md"
+    }
+  },
+  {
+    "id": "q21",
+    "query": "数据库里 human block 已经被工具调用更新为：  ``` User's name is Xavier. Xavier just switched jobs to a hedge fund. ```  （旧版本是 `\"User's name is Xavier. Xavier works on time series forecasting.\"`）  这一步把最新的 blocks 拉进 `",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c17",
+      "chunk_indices": [
+        1
+      ],
+      "title": "_rebuild_memory_async场景走读：内存刷新、System Message重建与轻量diff过滤.md"
+    }
+  },
+  {
+    "id": "q22",
+    "query": "<tool_usage_rules> Rule: use send_message as last step </tool_usage_rules> ```  ---  ## 第 4 步：判断是否需要重建  ```python system_prompt_changed = agent_state.system not in curr_system_message_text # agent_sta",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c17",
+      "chunk_indices": [
+        3
+      ],
+      "title": "_rebuild_memory_async场景走读：内存刷新、System Message重建与轻量diff过滤.md"
+    }
+  },
+  {
+    "id": "q23",
+    "query": "---  ## 三、写入路径：内存怎么被修改（[[Core Memory工具执行层|模块二]]）  Core Memory 的修改必须通过工具，工具体系分两层：  1. **`letta/functions/function_sets/base.py`**：LLM 看到的函数签名 + docstring，这是\"接口层\"，只是让模型知道有哪些工具、参数是什么。 2. **`letta/service",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c18",
+      "chunk_indices": [
+        4
+      ],
+      "title": "⭐ Letta 记忆系统完整流程总结.md"
+    }
+  },
+  {
+    "id": "q24",
+    "query": "一句话区分：**Core Memory 是\"agent 的人格与用户画像\"，必须每次都在场；Archival/Recall 是\"agent 的图书馆和日记本\"，需要的时候才去翻。**  ---  ## 二、静态结构：数据怎么组织  ### 2.1 Core Memory 的数据结构（[[三种记忆联动：工具路由工厂、System Prompt组装管线与内置沙箱执行分离|模块一]]）  - 最小单元是",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c18",
+      "chunk_indices": [
+        2
+      ],
+      "title": "⭐ Letta 记忆系统完整流程总结.md"
+    }
+  }
+]

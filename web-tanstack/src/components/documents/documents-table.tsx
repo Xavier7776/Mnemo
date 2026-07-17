@@ -7,7 +7,7 @@ import {
   useReactTable,
 } from "@tanstack/react-table"
 import { useVirtualizer } from "@tanstack/react-virtual"
-import { CheckCircle2, FileUp, LoaderCircle, RefreshCw, Trash2, Upload, XCircle } from "lucide-react"
+import { CheckCircle2, FileUp, FolderUp, LoaderCircle, RefreshCw, Trash2, Upload, XCircle } from "lucide-react"
 import { useCallback, useMemo, useRef, useState } from "react"
 
 import { Badge } from "@/components/ui/badge"
@@ -27,6 +27,7 @@ export function DocumentsTable() {
   const queryClient = useQueryClient()
   const parentRef = useRef<HTMLDivElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
+  const folderRef = useRef<HTMLInputElement>(null)
   const [sorting, setSorting] = useState<SortingState>([])
   const [knowledgeSpaceId, setKnowledgeSpaceId] = useState("")
   const [filterSpaceId, setFilterSpaceId] = useState("")
@@ -313,12 +314,31 @@ export function DocumentsTable() {
     fileRef.current?.click()
   }
 
+  const handlePickFolder = () => {
+    folderRef.current?.click()
+  }
+
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const fileList = event.target.files
     if (fileList && fileList.length > 0) {
       uploadMutation.mutate(Array.from(fileList))
     }
     // 清空 input，便于重复选择同一文件
+    event.target.value = ""
+  }
+
+  const handleFolderChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const fileList = event.target.files
+    if (fileList && fileList.length > 0) {
+      // 过滤掉非文件项（如目录本身）和隐藏文件，只保留真实文件
+      const files = Array.from(fileList).filter(
+        (f) => f.size > 0 && !f.name.startsWith("."),
+      )
+      if (files.length > 0) {
+        uploadMutation.mutate(files)
+      }
+    }
+    // 清空 input，便于重复选择同一文件夹
     event.target.value = ""
   }
 
@@ -409,21 +429,48 @@ export function DocumentsTable() {
               ref={fileRef}
               type="file"
             />
-            <Button
-              className="w-full"
-              onClick={handlePickFile}
-              variant="outline"
-              disabled={uploadMutation.isPending}
-            >
-              {uploadMutation.isPending ? (
-                <LoaderCircle className="size-4 animate-spin" />
-              ) : (
-                <FileUp className="size-4" />
-              )}
-              选择文件上传（支持多选）
-            </Button>
+            {/* 文件夹选择 input：webkitdirectory 支持递归选择文件夹下所有文件 */}
+            <input
+              className="hidden"
+              multiple
+              onChange={handleFolderChange}
+              ref={folderRef}
+              type="file"
+              // @ts-expect-error webkitdirectory 是非标准属性，TS 类型定义未包含
+              webkitdirectory=""
+              directory=""
+            />
+            <div className="flex gap-2">
+              <Button
+                className="flex-1"
+                onClick={handlePickFile}
+                variant="outline"
+                disabled={uploadMutation.isPending}
+              >
+                {uploadMutation.isPending ? (
+                  <LoaderCircle className="size-4 animate-spin" />
+                ) : (
+                  <FileUp className="size-4" />
+                )}
+                选择文件
+              </Button>
+              <Button
+                className="flex-1"
+                onClick={handlePickFolder}
+                variant="outline"
+                disabled={uploadMutation.isPending}
+                title="选择文件夹会自动添加该文件夹下所有支持格式的文件（含子目录）"
+              >
+                {uploadMutation.isPending ? (
+                  <LoaderCircle className="size-4 animate-spin" />
+                ) : (
+                  <FolderUp className="size-4" />
+                )}
+                选择文件夹
+              </Button>
+            </div>
             <div className="text-xs leading-5 text-slate-500">
-              支持 PDF / Word / Markdown / TXT / 图片等。可拖拽文件到此处批量上传。
+              支持 PDF / Word / Markdown / TXT / 图片等。可选择文件、文件夹或拖拽到此处批量上传。
             </div>
 
             {uploadQueue.length > 0 ? (

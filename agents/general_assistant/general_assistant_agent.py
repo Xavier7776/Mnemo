@@ -89,11 +89,6 @@ class GeneralAssistantAgent(BaseAgent):
         selected_model = self.fixed_model or os.getenv("LLM_MODEL", "mimo-v2.5")
         logger.info(f"GeneralAssistantAgent: 使用模型: {selected_model}")
 
-        # === Agentic RAG 回滚开关 ===
-        # ENABLE_RAG_PRE_RETRIEVE=true 时回退到改造前的"前置检索"模式
-        # 默认 false：走 Agentic RAG 自适应检索（Agent 自主调用 rag_retrieve 工具）
-        pre_retrieve_mode = os.getenv("ENABLE_RAG_PRE_RETRIEVE", "false").lower() in ("true", "1", "yes")
-
         # 1. RAG 上下文准备
         rag_context = ""
         sources = []
@@ -105,7 +100,7 @@ class GeneralAssistantAgent(BaseAgent):
         # 构造 Agentic RAG 工具执行上下文
         # 这个字典在整个 Agent 执行周期内保持状态，供 rag_retrieve 工具读取/更新
         tool_execution_context = None
-        if enable_rag and not pre_retrieve_mode:
+        if enable_rag:
             tool_execution_context = {
                 "document_id": document_id,
                 "assistant_id": assistant_id,
@@ -115,33 +110,12 @@ class GeneralAssistantAgent(BaseAgent):
                     "seen_chunk_ids": set(),       # 跨轮次去重
                     "total_retrieval_count": 0,    # 已检索次数
                     "max_retrievals": 5,           # 安全阀：最多检索 5 次
-                    # —— 阶段三新增 ——
                     "observations": [],            # 历次观察列表
                     "collected_evidence": [],      # 收集的验证后证据（供 Agent 层回收）
                     "reflections": [],             # 历次反思结果
                 },
             }
-            logger.info(f"GeneralAssistantAgent: Agentic RAG 模式（阶段三：Plan-Act-Observe-Reflect），Agent 将自主决定是否调用 rag_retrieve 工具")
-        elif enable_rag and pre_retrieve_mode:
-            # === 回滚模式：前置一次性检索（改造前的行为）===
-            try:
-                logger.info(f"GeneralAssistantAgent: [回滚模式] 开始前置RAG检索 - 问题: {task[:50]}...")
-                retrieval_result = await rag_service.retrieve_context(
-                    query=task,
-                    document_id=document_id,
-                    assistant_id=assistant_id,
-                    knowledge_space_ids=knowledge_space_ids,
-                    embedding_model=embedding_model,
-                )
-                rag_context = retrieval_result.get("context", "")
-                sources = retrieval_result.get("sources", [])
-                evidence = retrieval_result.get("evidence", [])
-                query_plan = retrieval_result.get("query_plan", {})
-                rag_trace = retrieval_result.get("trace", {})
-                recommended_resources = retrieval_result.get("recommended_resources", [])
-                logger.info(f"GeneralAssistantAgent: [回滚模式] RAG检索完成 - 上下文长度: {len(rag_context)}, 来源数: {len(sources)}")
-            except Exception as e:
-                logger.warning(f"GeneralAssistantAgent: [回滚模式] RAG检索失败: {e}")
+            logger.info(f"GeneralAssistantAgent: Agentic RAG 模式（Plan-Act-Observe-Reflect），Agent 将自主决定是否调用 rag_retrieve 工具")
 
         # 2. 使用 LLM 生成回复
         try:

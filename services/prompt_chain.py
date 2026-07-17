@@ -191,43 +191,11 @@ class PromptChain:
 
 ### 6. 工具函数使用
 
-系统提供了以下工具函数，你可以使用它们获取基础数据：
+系统提供了以下工具函数，你可以使用它们获取基础数据。工具通过 Function Calling 机制调用，系统会自动处理参数格式：
 
 """ + tools_description + """
 
-#### 6.1 工具函数调用格式
-当用户询问系统信息、模型列表、知识库文档等基础数据时，你可以使用以下格式调用工具函数：
-
-**格式说明**：
-```
-<function_calls>
-<invoke name="get_system_info">
-<parameter name="参数名">参数值</parameter>
-</invoke>
-</function_calls>
-```
-（其中 name 的值必须是下面列出的实际工具函数名称之一，例如 get_system_info、get_knowledge_base_documents 等）
-
-**实际示例**：
-```
-<function_calls>
-<invoke name="get_system_info">
-</invoke>
-</function_calls>
-```
-
-或带参数的调用：
-```
-<function_calls>
-<invoke name="get_knowledge_base_documents">
-<parameter name="limit">10</parameter>
-</invoke>
-</function_calls>
-```
-
-**重要**：name属性的值必须是实际的工具函数名称（如 get_system_info、get_knowledge_base_documents 等），不能使用占位符文本。
-
-#### 6.2 工具函数使用场景（必须调用）
+#### 6.1 工具函数使用场景（必须调用）
 - **get_available_ollama_models**：当用户询问可用模型、模型列表时**必须调用**
 - **get_knowledge_base_documents**：当用户询问知识库文档列表、文档数量、知识库情况时**必须调用**
 - **get_knowledge_base_stats**：当用户询问知识库详细统计、向量数量、知识库状态时**必须调用**
@@ -235,13 +203,10 @@ class PromptChain:
 
 **重要提醒**：当用户询问知识库信息、模型信息、系统配置等问题时，绝对不能使用记忆中的信息，必须通过调用相应的工具函数来获取实时数据。这是确保信息准确性的关键。
 
-#### 6.3 工具函数调用后处理
+#### 6.2 工具函数调用后处理
 - 调用工具函数后，系统会返回相应的数据
 - 基于返回的数据回答用户的问题
-- 如果工具函数调用失败，请检查参数格式并修正后重试：
-  - 数组类型参数（如 `sources`）应直接写 JSON 数组 `[{"type": "web"}]`，不要用字符串包裹
-  - 对象类型参数应直接写 JSON 对象 `{"key": "value"}`
-  - 如果重试后仍然失败，说明原因并基于已有信息回答
+- 如果工具函数调用失败，请检查参数并重试；如果重试后仍然失败，说明原因并基于已有信息回答
 
 ### 7. 特殊场景处理
 
@@ -351,7 +316,7 @@ class PromptChain:
         system_instruction = (
             system_instruction
             + "\n\n## 工具调用规则\n"
-            + "如果当前问题不需要调用任何工具，直接给出最终回答，不要输出 `<function_calls>`。"
+            + "如果当前问题不需要调用任何工具，直接给出最终回答。"
             + "只有当确实需要查询实时数据（如知识库状态、系统信息）或操作长期记忆（core_memory / archival_memory）时才调用工具。"
         )
 

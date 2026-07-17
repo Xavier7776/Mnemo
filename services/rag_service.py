@@ -11,29 +11,6 @@ from utils.citation import format_evidence_context
 class RAGService:
     """RAG服务封装（通过HTTP调用知识库服务）"""
 
-    def _dynamic_retrieval_params(self, query: str) -> Dict[str, int]:
-        """
-        在线动态调参（粗粒度启发式）：
-        - 行业报告允许更高延迟/大上下文，因此默认扩大 prefetch_k
-        - 对对比/多约束类问题适当增大 final_k
-        """
-        q = (query or "").strip()
-        q_len = len(q)
-        is_compare = any(k in q for k in ("对比", "比较", "差异", "优缺点", "优劣", "分别", "各自", "相同点", "不同点"))
-        is_list = any(k in q for k in ("有哪些", "列举", "总结", "概括", "要点", "关键点", "核心观点", "主要结论"))
-        is_clause = any(k in q for k in ("依据", "条款", "规定", "标准", "口径", "定义", "范围", "假设", "条件"))
-
-        prefetch_k = 200
-        final_k = 12
-
-        if q_len > 80 or is_compare or is_list:
-            final_k = 20
-        if is_clause:
-            prefetch_k = 260
-            final_k = max(final_k, 16)
-
-        return {"prefetch_k": prefetch_k, "final_k": final_k}
-    
     async def retrieve_context(
         self,
         query: str,
@@ -411,61 +388,5 @@ class RAGService:
             "recommended_resources": []
         }
     
-    async def generate_response(
-        self,
-        query: str,
-        document_id: Optional[str] = None,
-        use_context: bool = True,
-        fallback_on_error: bool = True,
-        assistant_id: Optional[str] = None,
-        collection_name: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        生成回复（包含RAG检索）
-        
-        Args:
-            query: 用户查询
-            document_id: 可选的文档ID过滤
-            use_context: 是否使用RAG上下文
-            fallback_on_error: 当检索失败时是否回退到不使用上下文（默认True）
-            assistant_id: 可选的助手ID（用于获取集合名称）
-            collection_name: 可选的集合名称（如果提供则直接使用）
-        
-        Returns:
-            包含回复和来源信息的字典
-        """
-        context = None
-        sources = []
-        retrieval_result: Dict[str, Any] = {"recommended_resources": [], "evidence": [], "query_plan": {}, "trace": {}}
-        
-        if use_context:
-            try:
-                retrieval_result = await self.retrieve_context(query, document_id, assistant_id, collection_name)
-                context = retrieval_result["context"]
-                sources = retrieval_result["sources"]
-                logger.info(f"RAG检索成功 - 检索到 {len(sources)} 个来源")
-            except Exception as e:
-                error_msg = str(e)
-                logger.warning(f"RAG检索失败: {error_msg}")
-                
-                if fallback_on_error:
-                    logger.info("回退到不使用上下文的模式继续处理")
-                    # 返回空上下文，让服务继续运行
-                    context = None
-                    sources = []
-                else:
-                    # 如果不允许回退，重新抛出异常
-                    raise
-        
-        return {
-            "context": context,
-            "sources": sources,
-            "evidence": retrieval_result.get("evidence", []),
-            "query_plan": retrieval_result.get("query_plan", {}),
-            "trace": retrieval_result.get("trace", {}),
-            "recommended_resources": retrieval_result.get("recommended_resources", [])
-        }
-
-
 # 全局RAG服务实例
 rag_service = RAGService()

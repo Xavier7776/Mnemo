@@ -46,7 +46,7 @@
         "firecrawl-mcp"
       ],
       "env": {
-        "FIRECRAWL_API_KEY": "fc-60fb4ecff4ea405682c5141fdc776a58"
+        "FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"
       },
       "url": null,
       "enabled": true,

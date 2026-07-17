@@ -23,6 +23,7 @@ class LLMService:
         self._timeout = None
         self._base_prompt_cache = None
         self._base_prompt_cache_time = 0
+        self._adapter_cache = None
 
         logger.info(f"模型服务初始化 - 模型: {self.model_name}")
 
@@ -46,7 +47,16 @@ class LLMService:
         if self._timeout is None:
             self._timeout = float(os.getenv("LLM_TIMEOUT", "600.0"))
         return self._timeout
-    
+
+    @property
+    def _adapter(self):
+        """Function Calling 统一适配器（惰性初始化，基于 base_url/model 自动探测厂商）"""
+        if self._adapter_cache is None:
+            from services.tool_call_adapter import ToolCallAdapter
+            base_url = self._base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("OLLAMA_BASE_URL") or ""
+            self._adapter_cache = ToolCallAdapter.from_env(base_url=base_url, model_name=self.model_name)
+        return self._adapter_cache
+
     async def list_models(self) -> List[Dict[str, Any]]:
         """获取可用模型列表"""
         try:
@@ -234,7 +244,9 @@ class LLMService:
         messages.append({"role": "user", "content": user_message})
         
         # ——— 5. Process tool calls ———
-        tool_context_added = await self._process_tool_calls_in_messages(messages, assistant_id=assistant_id)
+        # 原生 Function Calling 模式下，工具调用在 _generate_stream 中通过 LLM 原生 tools 参数处理，
+        # 不再需要在 messages 预处理阶段解析 <function_calls> XML。
+        tool_context_added = False
 
         # ——— 6. 保存完整上下文到文件（便于调试和查看 prompt）———
         try:
@@ -260,84 +272,6 @@ class LLMService:
 
         return messages, tool_context_added
     
-    async def _process_tool_calls_in_messages(
-        self,
-        messages: List[Dict[str, str]],
-        assistant_id: Optional[str] = None
-    ) -> bool:
-        """处理 messages 中的工具函数调用"""
-        import re
-        from services.ai_tools import ai_tools
-        
-        last_user_msg = messages[-1]["content"] if messages else ""
-        if not last_user_msg:
-            return False
-        
-        pattern = r'<function_calls>\s*<invoke\s+name="([^"]+)">\s*(.*?)\s*</invoke>\s*</function_calls>'
-        matches = list(re.finditer(pattern, last_user_msg, re.DOTALL))
-        if not matches:
-            return False
-        
-        tool_results = []
-        for match in matches:
-            tool_name = match.group(1).strip()
-            params_text = match.group(2)
-            
-            if not tool_name or tool_name in [
-                "工具函数名称", "function_name", "tool_name",
-                "函数名称", "实际的工具函数名称"
-            ]:
-                logger.warning(f"检测到占位符工具函数名称: '{tool_name}'，跳过调用")
-                continue
-            
-            if tool_name not in ai_tools.functions:
-                logger.warning(f"未知的工具函数: '{tool_name}'")
-                continue
-            
-            # 解析参数
-            params = {}
-            param_pattern = r'<parameter\s+name="([^"]+)">([^<]+)</parameter>'
-            for pm in re.finditer(param_pattern, params_text):
-                pname = pm.group(1)
-                pvalue = pm.group(2).strip()
-                if pvalue.isdigit():
-                    params[pname] = int(pvalue)
-                elif '.' in pvalue and pvalue.replace('.', '').isdigit():
-                    params[pname] = float(pvalue)
-                elif pvalue.lower() in ('true', 'false'):
-                    params[pname] = pvalue.lower() == 'true'
-                elif pvalue.startswith(('[', '{')):
-                    # JSON 结构（数组/对象）反序列化，避免传给 MCP 时变成字符串
-                    try:
-                        params[pname] = json.loads(pvalue)
-                    except json.JSONDecodeError:
-                        params[pname] = pvalue
-                else:
-                    params[pname] = pvalue
-            
-            # 自动注入 assistant_id
-            tool_schema = ai_tools.tools.get(tool_name, {})
-            tool_params_schema = tool_schema.get("parameters", {}).get("properties", {})
-            if "assistant_id" in tool_params_schema and "assistant_id" not in params and assistant_id:
-                params["assistant_id"] = assistant_id
-            
-            try:
-                result = await ai_tools.async_call_tool(tool_name, params if params else None)
-                tool_results.append({"tool": tool_name, "result": result})
-                logger.info(f"成功调用工具函数: {tool_name}")
-            except Exception as e:
-                logger.error(f"调用工具函数 {tool_name} 失败: {str(e)}")
-                tool_results.append({"tool": tool_name, "result": {"success": False, "error": str(e)}})
-        
-        if tool_results:
-            results_text = "\n\n工具函数调用结果：\n"
-            for tr in tool_results:
-                results_text += f"\n调用 {tr['tool']} 的结果：\n{json.dumps(tr['result'], ensure_ascii=False, indent=2)}\n"
-            messages[-1]["content"] += results_text
-            return True
-        
-        return False
-    
     async def _generate_stream(
         self,
         messages: List[Dict[str, str]],
@@ -345,79 +279,90 @@ class LLMService:
         max_tool_rounds: int = 20,
         tool_execution_context: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[str, None]:
-        """流式生成 + 工具调用循环
+        """流式生成 + 原生 Function Calling 工具调用循环
+
+        使用 LLM 原生 tools 参数触发工具调用，通过 ToolCallAdapter 统一适配不同厂商的
+        Function Calling 差异，StreamAggregator 聚合流式工具调用增量。
 
         Args:
             tool_execution_context: Agentic RAG 工具执行上下文，用于向 rag_retrieve
                 工具注入检索范围参数和跨轮次去重状态。
         """
-        import re
         from services.ai_tools import ai_tools
+        from services.tool_call_adapter import (
+            CanonicalToolCall,
+            CanonicalToolResult,
+            ToolSchemaConverter,
+            serialize_tool_result,
+        )
 
-        pattern = r'<function_calls>\s*<invoke\s+name="([^"]+)">\s*(.*?)\s*</invoke>\s*</function_calls>'
-        tool_call_start = '<function_calls>'
-        param_pattern = r'<parameter\s+name="([^"]+)">([^<]+)</parameter>'
-        placeholder_names = {"工具函数名称", "function_name", "tool_name", "函数名称", "实际的工具函数名称"}
+        adapter = self._adapter
+        # 工具 schema 转换：ai_tools 的 JSON Schema -> CanonicalTool -> 厂商特定格式
+        canonical_tools = ToolSchemaConverter.from_ai_tools_schema(ai_tools.get_tools_schema())
+        tools_payload = adapter.convert_tools(canonical_tools)
+        tool_choice = adapter.convert_tool_choice("auto")
 
         current_messages = list(messages)
 
         for round_idx in range(max_tool_rounds + 1):
             try:
-                logger.debug(f"流式生成 - 第{round_idx + 1}轮, 模型: {self.model_name}, messages: {len(current_messages)} 条")
+                logger.debug(
+                    f"流式生成 - 第{round_idx + 1}轮, 模型: {self.model_name}, "
+                    f"messages: {len(current_messages)} 条"
+                )
 
-                # 使用 AsyncOpenAI 客户端，避免同步迭代阻塞事件循环
+                # 使用 AsyncOpenAI 客户端，原生 tools 参数触发 Function Calling
                 stream = await self.async_client.chat.completions.create(
                     model=self.model_name,
                     messages=current_messages,
                     stream=True,
-                    timeout=self.timeout
+                    tools=tools_payload,
+                    tool_choice=tool_choice,
+                    timeout=self.timeout,
                 )
 
-                full_response = ""
-                yielded_length = 0  # 跟踪已 yield 的位置，避免重复输出
-                tool_call_detected = False
+                aggregator = adapter.create_stream_aggregator()
+                assistant_text = ""
+                canonical_calls: List[CanonicalToolCall] = []
                 chunk_count = 0
 
                 async for chunk in stream:
-                    if chunk.choices and len(chunk.choices) > 0:
-                        delta = chunk.choices[0].delta
+                    events = aggregator.process_chunk(chunk)
+                    thinking_emitted = False
+                    for event in events:
+                        etype = event["type"]
+                        if etype == "text":
+                            chunk_count += 1
+                            text = event["content"]
+                            assistant_text += text
+                            yield text
+                        elif etype == "thinking":
+                            thinking_emitted = True
+                            yield "\x1eTHINKING:" + json.dumps(
+                                {"content": event["content"]}, ensure_ascii=False
+                            ) + "\x1e"
+                        elif etype == "tool_call":
+                            canonical_calls.append(event["tool_call"])
+                        elif etype == "finish":
+                            # 流结束标记（tool_calls 已在 finish_reason=tool_calls 时聚合完毕）
+                            pass
 
-                        # 提取思考链（reasoning_content）— 推理模型（DeepSeek-R1、mimo-thinking 等）会输出此字段
-                        reasoning = getattr(delta, "reasoning_content", None)
-                        if reasoning is None and hasattr(delta, "model_extra"):
+                    # 兼容：部分厂商将 reasoning_content 放在 delta.model_extra 中，
+                    # 适配器的 StreamAggregator 仅检查直接属性，这里补充捕获，避免思考链丢失
+                    if not thinking_emitted and chunk.choices:
+                        delta = chunk.choices[0].delta
+                        reasoning = None
+                        if hasattr(delta, "model_extra"):
                             reasoning = (delta.model_extra or {}).get("reasoning_content")
                         if reasoning:
-                            yield "\x1eTHINKING:" + json.dumps({"content": reasoning}, ensure_ascii=False) + "\x1e"
+                            yield "\x1eTHINKING:" + json.dumps(
+                                {"content": reasoning}, ensure_ascii=False
+                            ) + "\x1e"
 
-                        if delta and delta.content:
-                            chunk_count += 1
-                            full_response += delta.content
-
-                            if tool_call_detected:
-                                # 已检测到工具调用，不再输出（等待完整标签后处理）
-                                continue
-                            if tool_call_start in full_response:
-                                tool_call_detected = True
-                                # 只输出尚未 yield 的部分（避免重复）
-                                idx = full_response.find(tool_call_start)
-                                before_text = full_response[yielded_length:idx]
-                                if before_text:
-                                    yield before_text
-                                yielded_length = idx
-                                continue
-                            # 阶段三修复：检测不完整的 <function 前缀（LLM 可能输出 <function 而非 <function_calls>）
-                            if '<function' in full_response and tool_call_start not in full_response:
-                                tool_call_detected = True
-                                idx = full_response.find('<function')
-                                before_text = full_response[yielded_length:idx]
-                                if before_text:
-                                    yield before_text
-                                yielded_length = idx
-                                continue
-                            yield delta.content
-                            yielded_length = len(full_response)
-
-                logger.info(f"流式生成 - 第{round_idx + 1}轮完成, {chunk_count} 块, 长度 {len(full_response)}, 工具调用: {tool_call_detected}")
+                logger.info(
+                    f"流式生成 - 第{round_idx + 1}轮完成, {chunk_count} 块, "
+                    f"文本长度 {len(assistant_text)}, 工具调用: {len(canonical_calls)} 个"
+                )
 
             except APITimeoutError:
                 logger.error(f"API 请求超时 (timeout={self.timeout}s)")
@@ -432,50 +377,30 @@ class LLMService:
                 logger.error(f"流式生成错误: {str(e)}", exc_info=True)
                 raise
 
-            if not tool_call_detected or round_idx >= max_tool_rounds:
-                if tool_call_detected and full_response:
-                    # 只处理尚未 yield 的部分，避免重复输出
-                    remaining = full_response[yielded_length:]
-                    cleaned = re.sub(pattern, '', remaining).strip()
-                    # 阶段三修复：移除不完整的 <function 标记（LLM 输出的非标准格式）
-                    cleaned = re.sub(r'<function(?!_calls>)[^\n]*\n?', '', cleaned).strip()
-                    if cleaned:
-                        yield cleaned
+            # 无工具调用，或已达最大轮次：结束流
+            if not canonical_calls or round_idx >= max_tool_rounds:
                 return
 
-            matches = list(re.finditer(pattern, full_response, re.DOTALL))
+            # —— 执行工具调用 ——
+            tool_results = []  # [{"tool", "params", "result", "tool_call_id"}]
+            canonical_results: List[CanonicalToolResult] = []
 
-            tool_results = []
-            for match in matches:
-                tool_name = match.group(1).strip()
-                params_text = match.group(2)
+            for tc in canonical_calls:
+                tool_name = tc.name
+                params = dict(tc.arguments or {})
 
-                if not tool_name or tool_name in placeholder_names:
-                    logger.warning(f"占位符工具名: '{tool_name}'，跳过")
+                if not tool_name or tool_name not in ai_tools.functions:
+                    logger.warning(f"未知工具函数: '{tool_name}'，跳过")
+                    err = {"success": False, "error": f"未知工具: {tool_name}"}
+                    tool_results.append({"tool": tool_name, "params": params, "result": err, "tool_call_id": tc.id})
+                    canonical_results.append(CanonicalToolResult(
+                        tool_call_id=tc.id,
+                        content=serialize_tool_result(err),
+                        is_error=True,
+                    ))
                     continue
-                if tool_name not in ai_tools.functions:
-                    logger.warning(f"未知工具函数: '{tool_name}'")
-                    continue
 
-                params = {}
-                for pm in re.finditer(param_pattern, params_text):
-                    pname = pm.group(1)
-                    pvalue = pm.group(2).strip()
-                    if pvalue.isdigit():
-                        params[pname] = int(pvalue)
-                    elif '.' in pvalue and pvalue.replace('.', '').isdigit():
-                        params[pname] = float(pvalue)
-                    elif pvalue.lower() in ('true', 'false'):
-                        params[pname] = pvalue.lower() == 'true'
-                    elif pvalue.startswith(('[', '{')):
-                        # JSON 结构（数组/对象）反序列化
-                        try:
-                            params[pname] = json.loads(pvalue)
-                        except json.JSONDecodeError:
-                            params[pname] = pvalue
-                    else:
-                        params[pname] = pvalue
-
+                # assistant_id 自动注入：基于 schema 检查是否需要注入
                 tool_schema = ai_tools.tools.get(tool_name, {})
                 tool_params_schema = tool_schema.get("parameters", {}).get("properties", {})
                 if "assistant_id" in tool_params_schema and "assistant_id" not in params and assistant_id:
@@ -483,11 +408,9 @@ class LLMService:
 
                 try:
                     # === Agentic RAG: rag_retrieve 工具特殊处理 ===
-                    # 不走 async_call_tool，直接调用 rag_retrieve_with_context
                     # 注入 tool_execution_context 中的检索范围参数和去重状态
                     if tool_name == "rag_retrieve" and tool_execution_context is not None:
                         retrieval_ctx = tool_execution_context.get("retrieval_context") or {}
-                        # 检索次数安全阀
                         max_retrievals = retrieval_ctx.get("max_retrievals", 5)
                         current_count = retrieval_ctx.get("total_retrieval_count", 0)
                         if current_count >= max_retrievals:
@@ -517,25 +440,34 @@ class LLMService:
                                 cid = chunk.get("chunk_id")
                                 if cid:
                                     retrieval_ctx.setdefault("seen_chunk_ids", set()).add(cid)
-                            logger.info(f"rag_retrieve 调用成功 (第{current_count + 1}次), 返回 {result.get('total_found', 0)} 个片段")
+                            logger.info(
+                                f"rag_retrieve 调用成功 (第{current_count + 1}次), "
+                                f"返回 {result.get('total_found', 0)} 个片段"
+                            )
                     else:
                         result = await ai_tools.async_call_tool(tool_name, params if params else None)
                         logger.info(f"工具调用成功: {tool_name}")
-                    tool_results.append({"tool": tool_name, "params": params, "result": result})
+
+                    tool_results.append({"tool": tool_name, "params": params, "result": result, "tool_call_id": tc.id})
+                    canonical_results.append(CanonicalToolResult(
+                        tool_call_id=tc.id,
+                        content=serialize_tool_result(result),
+                        is_error=isinstance(result, dict) and result.get("success") is False,
+                    ))
                 except Exception as e:
                     logger.error(f"工具调用 {tool_name} 失败: {str(e)}", exc_info=True)
-                    tool_results.append({"tool": tool_name, "params": params, "result": {"success": False, "error": str(e)}})
+                    err = {"success": False, "error": str(e)}
+                    tool_results.append({"tool": tool_name, "params": params, "result": err, "tool_call_id": tc.id})
+                    canonical_results.append(CanonicalToolResult(
+                        tool_call_id=tc.id,
+                        content=serialize_tool_result(err),
+                        is_error=True,
+                    ))
 
             if not tool_results:
-                remaining = full_response[yielded_length:]
-                cleaned = re.sub(pattern, '', remaining).strip()
-                # 阶段三修复：移除不完整的 <function 标记
-                cleaned = re.sub(r'<function(?!_calls>)[^\n]*\n?', '', cleaned).strip()
-                if cleaned:
-                    yield cleaned
                 return
 
-            # 向前端发送工具调用事件（用 ASCII 记录分隔符 \x1e 包裹，agent.execute 会解析并转换为 tool_call 事件）
+            # 向前端发送工具调用事件（ASCII 记录分隔符 \x1e 包裹，agent.execute 会解析）
             tool_call_event = {
                 "round": round_idx + 1,
                 "tools": [
@@ -558,20 +490,25 @@ class LLMService:
                     tool_results, tool_execution_context, round_idx + 1
                 )
 
+            # 用适配器构造厂商特定的工具结果消息（替代原来的文本拼接）
+            tool_result_messages = adapter.build_tool_result_messages(
+                assistant_content=assistant_text,
+                tool_calls=canonical_calls,
+                tool_results=canonical_results,
+            )
+            current_messages.extend(tool_result_messages)
+
+            # —— 基于反思结果动态生成下一轮提示 ——
             results_text = "\n\n工具函数调用结果：\n"
             for tr in tool_results:
                 results_text += f"\n调用 {tr['tool']} 的结果：\n{json.dumps(tr['result'], ensure_ascii=False, indent=2)}\n"
 
-            current_messages.append({"role": "assistant", "content": full_response})
-
-            # —— 阶段三：基于反思结果动态生成下一轮提示 ——
             if reflection_result and not reflection_result.get("sufficient", True):
                 # 证据不足，引导 Agent 继续检索
                 gaps_text = "；".join(reflection_result.get("gaps", [])) or "证据不够充分"
                 next_query_hint = ""
                 if reflection_result.get("next_query") and reflection_result.get("next_query") != reflection_result.get("original_query", ""):
                     next_query_hint = f"\n建议尝试用不同的查询关键词再次检索，例如：'{reflection_result['next_query']}'"
-
                 current_messages.append({
                     "role": "user",
                     "content": (
@@ -587,7 +524,6 @@ class LLMService:
                 # 检查是否有失败的工具调用，如果有则允许 LLM 修正参数重试
                 failed_tools = [tr for tr in tool_results if isinstance(tr.get("result"), dict) and not tr["result"].get("success", True)]
                 if failed_tools and round_idx < max_tool_rounds:
-                    # 有工具失败且还有重试机会，引导 LLM 修正参数重试
                     failed_text = "\n".join(
                         f"工具 {tr['tool']} 失败: {tr['result'].get('error', '未知错误')}"
                         for tr in failed_tools

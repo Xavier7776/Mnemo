@@ -113,7 +113,6 @@ export interface ChatSendRequest {
   assistant_id?: string
   knowledge_space_ids?: string[]
   enable_rag?: boolean
-  mode?: "normal" | "network"
 }
 
 export interface SourceInfo {

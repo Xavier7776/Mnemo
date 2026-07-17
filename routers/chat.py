@@ -73,7 +73,6 @@ class ChatRequest(BaseModel):
     knowledge_space_ids: Optional[List[str]] = None  # 发起增强检索前可选知识空间（可多选）
     conversation_id: Optional[str] = None
     enable_rag: bool = True  # 是否启用RAG检索
-    mode: str = "normal"  # 模式：normal（普通模式）或 network（网络检索模式）
     generation_config: Optional[Dict[str, Any]] = None  # 模型配置：{"llm_model": "...", "embedding_model": "..."}
 
 

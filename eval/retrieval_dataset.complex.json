@@ -1,0 +1,422 @@
+[
+  {
+    "id": "easy_01",
+    "query": "Redis 事务中 WATCH 命令的作用是什么？",
+    "difficulty": "easy",
+    "category": "java",
+    "expected": "all_strategies_should_hit",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b4",
+      "chunk_indices": [43],
+      "title": "redis.md"
+    }
+  },
+  {
+    "id": "easy_02",
+    "query": "ThreadLocal 有什么用？",
+    "difficulty": "easy",
+    "category": "java",
+    "expected": "all_strategies_should_hit",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b6",
+      "chunk_indices": [0],
+      "title": "并发.md"
+    }
+  },
+  {
+    "id": "easy_03",
+    "query": "Java 双亲委派模型的执行流程是什么？",
+    "difficulty": "easy",
+    "category": "java",
+    "expected": "all_strategies_should_hit",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b2",
+      "chunk_indices": [46],
+      "title": "jvm.md"
+    }
+  },
+  {
+    "id": "easy_04",
+    "query": "MemGPT 的内存压力警告阈值是多少？",
+    "difficulty": "easy",
+    "category": "letta",
+    "expected": "all_strategies_should_hit",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c21",
+      "chunk_indices": [8],
+      "title": "MemGPT 架构理解总结.md"
+    }
+  },
+  {
+    "id": "easy_05",
+    "query": "Letta 中 max_steps 的作用是什么？",
+    "difficulty": "easy",
+    "category": "letta",
+    "expected": "all_strategies_should_hit",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c23",
+      "chunk_indices": [10],
+      "title": "Step循环完整调用链.md"
+    }
+  },
+  {
+    "id": "easy_06",
+    "query": "Recall Memory 的两种检索入口是什么？",
+    "difficulty": "easy",
+    "category": "letta",
+    "expected": "all_strategies_should_hit",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c22",
+      "chunk_indices": [10],
+      "title": "Recall Memory混合检索：双入口架构、Turbopuffer降级与RRF分数融合.md"
+    }
+  },
+  {
+    "id": "easy_07",
+    "query": "Archival Memory 默认是主动读还是被动读？",
+    "difficulty": "easy",
+    "category": "letta",
+    "expected": "all_strategies_should_hit",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c1d",
+      "chunk_indices": [11],
+      "title": "Archival Memory双存储与概念纠偏.md"
+    }
+  },
+  {
+    "id": "easy_08",
+    "query": "Letta 工具执行器工厂有几种 ToolType 映射？",
+    "difficulty": "easy",
+    "category": "letta",
+    "expected": "all_strategies_should_hit",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c26",
+      "chunk_indices": [22],
+      "title": "三种记忆联动：工具路由工厂、System Prompt组装管线与内置沙箱执行分离.md"
+    }
+  },
+  {
+    "id": "easy_09",
+    "query": "Redis 的 SLOWLOG 命令怎么使用？",
+    "difficulty": "easy",
+    "category": "java",
+    "expected": "all_strategies_should_hit",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b4",
+      "chunk_indices": [85],
+      "title": "redis.md"
+    }
+  },
+  {
+    "id": "easy_10",
+    "query": "Callable 和 Future 之间是什么关系？",
+    "difficulty": "easy",
+    "category": "java",
+    "expected": "all_strategies_should_hit",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b6",
+      "chunk_indices": [40],
+      "title": "并发.md"
+    }
+  },
+  {
+    "id": "medium_01",
+    "query": "Redis 如何监控键的变化来实现乐观并发控制？",
+    "difficulty": "medium",
+    "category": "java",
+    "expected": "vector_advantage",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b4",
+      "chunk_indices": [43],
+      "title": "redis.md"
+    }
+  },
+  {
+    "id": "medium_02",
+    "query": "为什么需要为每个线程提供独立的变量副本？",
+    "difficulty": "medium",
+    "category": "java",
+    "expected": "vector_advantage",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b6",
+      "chunk_indices": [0],
+      "title": "并发.md"
+    }
+  },
+  {
+    "id": "medium_03",
+    "query": "类加载器在 SPI 场景下如何解决父加载器看不到子加载器类的问题？",
+    "difficulty": "medium",
+    "category": "java",
+    "expected": "vector_advantage",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b2",
+      "chunk_indices": [91],
+      "title": "jvm.md"
+    }
+  },
+  {
+    "id": "medium_04",
+    "query": "MemGPT 在上下文窗口接近满载时如何自我调节？",
+    "difficulty": "medium",
+    "category": "letta",
+    "expected": "vector_advantage",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c21",
+      "chunk_indices": [8],
+      "title": "MemGPT 架构理解总结.md"
+    }
+  },
+  {
+    "id": "medium_05",
+    "query": "Letta 单次请求超出上下文窗口时如何处理？",
+    "difficulty": "medium",
+    "category": "letta",
+    "expected": "vector_advantage",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c23",
+      "chunk_indices": [10],
+      "title": "Step循环完整调用链.md"
+    }
+  },
+  {
+    "id": "medium_06",
+    "query": "Letta 的消息级检索和组织级检索有什么差异？",
+    "difficulty": "medium",
+    "category": "letta",
+    "expected": "vector_advantage",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c22",
+      "chunk_indices": [10],
+      "title": "Recall Memory混合检索：双入口架构、Turbopuffer降级与RRF分数融合.md"
+    }
+  },
+  {
+    "id": "medium_07",
+    "query": "Letta 的归档存储何时被读取？写入时向量如何生成？",
+    "difficulty": "medium",
+    "category": "letta",
+    "expected": "vector_advantage",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c1d",
+      "chunk_indices": [11],
+      "title": "Archival Memory双存储与概念纠偏.md"
+    }
+  },
+  {
+    "id": "medium_08",
+    "query": "Letta 根据工具类型分发到不同执行器的设计模式",
+    "difficulty": "medium",
+    "category": "letta",
+    "expected": "vector_advantage",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c26",
+      "chunk_indices": [22],
+      "title": "三种记忆联动：工具路由工厂、System Prompt组装管线与内置沙箱执行分离.md"
+    }
+  },
+  {
+    "id": "medium_09",
+    "query": "Redis 慢查询日志的查看和清理命令",
+    "difficulty": "medium",
+    "category": "java",
+    "expected": "vector_advantage",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b4",
+      "chunk_indices": [85],
+      "title": "redis.md"
+    }
+  },
+  {
+    "id": "medium_10",
+    "query": "Java 异步任务如何封装可取消的执行结果？",
+    "difficulty": "medium",
+    "category": "java",
+    "expected": "vector_advantage",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b6",
+      "chunk_indices": [40],
+      "title": "并发.md"
+    }
+  },
+  {
+    "id": "hard_01",
+    "query": "完整描述 Redis 事务的全部命令（包括取消和监听机制）以及慢查询日志的使用方式",
+    "difficulty": "hard",
+    "category": "java",
+    "expected": "hybrid_advantage",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b4",
+      "chunk_indices": [43, 85],
+      "title": "redis.md"
+    }
+  },
+  {
+    "id": "hard_02",
+    "query": "Java 类加载的委派机制执行流程，以及 SPI 场景下如何打破这种委派",
+    "difficulty": "hard",
+    "category": "java",
+    "expected": "hybrid_advantage",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b2",
+      "chunk_indices": [46, 91],
+      "title": "jvm.md"
+    }
+  },
+  {
+    "id": "hard_03",
+    "query": "Letta MemGPT 的完整消息处理流程，以及上下文压力的应对阈值",
+    "difficulty": "hard",
+    "category": "letta",
+    "expected": "hybrid_advantage",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c21",
+      "chunk_indices": [4, 8],
+      "title": "MemGPT 架构理解总结.md"
+    }
+  },
+  {
+    "id": "hard_04",
+    "query": "Letta Step 循环的上下文管理策略、最大步数限制和执行追踪结构",
+    "difficulty": "hard",
+    "category": "letta",
+    "expected": "hybrid_advantage",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c23",
+      "chunk_indices": [10, 19],
+      "title": "Step循环完整调用链.md"
+    }
+  },
+  {
+    "id": "hard_05",
+    "query": "Letta 工具执行器工厂的整体设计和七类工具类型映射",
+    "difficulty": "hard",
+    "category": "letta",
+    "expected": "hybrid_advantage",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c26",
+      "chunk_indices": [0, 22],
+      "title": "三种记忆联动：工具路由工厂、System Prompt组装管线与内置沙箱执行分离.md"
+    }
+  },
+  {
+    "id": "hard_06",
+    "query": "ThreadLocal 的作用、Callable/Future 关系和 CyclicBarrier 的使用",
+    "difficulty": "hard",
+    "category": "java",
+    "expected": "hybrid_advantage",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b6",
+      "chunk_indices": [0, 40, 80],
+      "title": "并发.md"
+    }
+  },
+  {
+    "id": "hard_07",
+    "query": "Letta Recall Memory 的混合检索架构和 Agent 级 vs 组织级差异",
+    "difficulty": "hard",
+    "category": "letta",
+    "expected": "hybrid_advantage",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c22",
+      "chunk_indices": [0, 10],
+      "title": "Recall Memory混合检索：双入口架构、Turbopuffer降级与RRF分数融合.md"
+    }
+  },
+  {
+    "id": "hard_08",
+    "query": "Letta Archival Memory 的设计、Core Memory 概念和 embedding 生成时机",
+    "difficulty": "hard",
+    "category": "letta",
+    "expected": "hybrid_advantage",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c1d",
+      "chunk_indices": [0, 11],
+      "title": "Archival Memory双存储与概念纠偏.md"
+    }
+  },
+  {
+    "id": "extreme_01",
+    "query": "对比 Redis 事务的 WATCH 机制和 Letta Step 循环的上下文管理在并发控制思路上的异同",
+    "difficulty": "extreme",
+    "category": "cross",
+    "expected": "needs_query_decomposition",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b4",
+      "secondary_document_id": "6a575d8ef3e714a659395c23",
+      "chunk_indices": [43],
+      "secondary_chunk_indices": [10],
+      "title": "redis.md + Step循环完整调用链.md"
+    }
+  },
+  {
+    "id": "extreme_02",
+    "query": "Java 双亲委派模型的层次委派和 Letta 工具执行器工厂的类型路由在解耦设计上的相似之处",
+    "difficulty": "extreme",
+    "category": "cross",
+    "expected": "needs_query_decomposition",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b2",
+      "secondary_document_id": "6a575d8ef3e714a659395c26",
+      "chunk_indices": [46],
+      "secondary_chunk_indices": [22],
+      "title": "jvm.md + 三种记忆联动.md"
+    }
+  },
+  {
+    "id": "extreme_03",
+    "query": "ThreadLocal 的线程隔离和 Letta Core Memory 的 agent 隔离在数据隔离思路上的对比",
+    "difficulty": "extreme",
+    "category": "cross",
+    "expected": "needs_query_decomposition",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b6",
+      "secondary_document_id": "6a575d8ef3e714a659395c1d",
+      "chunk_indices": [0],
+      "secondary_chunk_indices": [11],
+      "title": "并发.md + Archival Memory双存储与概念纠偏.md"
+    }
+  },
+  {
+    "id": "extreme_04",
+    "query": "Java FutureTask 的异步任务管理异常处理和 Letta 工具执行异常兜底机制在设计上的差异",
+    "difficulty": "extreme",
+    "category": "cross",
+    "expected": "needs_query_decomposition",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b6",
+      "secondary_document_id": "6a575d8ef3e714a659395c2a",
+      "chunk_indices": [40],
+      "secondary_chunk_indices": [0],
+      "title": "并发.md + 工具执行异常兜底与完整调用链.md"
+    }
+  },
+  {
+    "id": "extreme_05",
+    "query": "Redis 内存数据库的持久化机制和 Letta Archival Memory 的双存储设计在可靠性思路上的对比",
+    "difficulty": "extreme",
+    "category": "cross",
+    "expected": "needs_query_decomposition",
+    "gold": {
+      "document_id": "6a575d48f3e714a6593958b4",
+      "secondary_document_id": "6a575d8ef3e714a659395c1d",
+      "chunk_indices": [0],
+      "secondary_chunk_indices": [0],
+      "title": "redis.md + Archival Memory双存储与概念纠偏.md"
+    }
+  },
+  {
+    "id": "extreme_06",
+    "query": "MemGPT 的内存压力阈值管理和 JVM 内存区域划分在内存管理思路上的异同",
+    "difficulty": "extreme",
+    "category": "cross",
+    "expected": "needs_query_decomposition",
+    "gold": {
+      "document_id": "6a575d8ef3e714a659395c21",
+      "secondary_document_id": "6a575d48f3e714a6593958b2",
+      "chunk_indices": [8],
+      "secondary_chunk_indices": [0],
+      "title": "MemGPT架构.md + jvm.md"
+    }
+  }
+]

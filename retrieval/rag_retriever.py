@@ -75,24 +75,6 @@ class RAGRetriever:
             self._reranker = None
             return None
 
-    def retrieve(self, query: str, document_id: Optional[str] = None, collection_name: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        同步检索方法（向后兼容，但不推荐用于新功能）
-        注意：此方法无法使用异步的图谱检索和实体提取，会降级为基础检索。
-        """
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                 # 这是一个hack，如果在运行中的loop里调用同步方法，我们无法直接运行async
-                 # 这里只能降级为仅使用向量+关键词检索
-                 logger.warning("在运行中的循环中调用同步 retrieve，降级为基础检索")
-                 return self._basic_retrieve(query, document_id, collection_name)
-            else:
-                 return loop.run_until_complete(self.retrieve_async(query, document_id, collection_name))
-        except RuntimeError:
-            return asyncio.run(self.retrieve_async(query, document_id, collection_name))
-
     async def retrieve_async(
         self,
         query: str,
@@ -142,7 +124,10 @@ class RAGRetriever:
             modules = {}
 
         if graph_enabled is None:
-            graph_enabled = bool(modules.get("kg_retrieve_enabled", True)) and use_graph
+            # 同时检查 runtime_config 和 NEO4J_ENABLED 环境变量
+            # NEO4J_ENABLED=false 时直接禁用图谱检索，避免每题浪费 ~18s 调用空图谱
+            neo4j_enabled = os.getenv("NEO4J_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+            graph_enabled = neo4j_enabled and bool(modules.get("kg_retrieve_enabled", True)) and use_graph
 
         # 1. 并行执行多种检索策略（按 strategy 选择性启用）
         queries = [q for q in (query_variants or [query]) if q and q.strip()]
@@ -256,13 +241,6 @@ class RAGRetriever:
                 k = min(k_max, max(k, 24))
 
         return max(k_min, min(k_max, k))
-
-    def _basic_retrieve(self, query: str, document_id: Optional[str] = None, collection_name: Optional[str] = None) -> List[Dict[str, Any]]:
-        """仅包含向量和关键词的基础检索"""
-        vector_results = asyncio.run(self._vector_search(query, document_id, collection_name))
-        keyword_results = asyncio.run(self._keyword_search(query, document_id))
-        merged = self._merge_results(vector_results, keyword_results, [])
-        return merged[: self.final_k]
 
     # # groups 是多个结果列表组成的列表
     # groups = [
@@ -576,50 +554,8 @@ class RAGRetriever:
         keyword_results: List[Dict[str, Any]],
         graph_results: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """合并多种检索结果"""
-        #只看排名
-        if self.fusion_strategy == "rrf":
-            return self._merge_results_rrf(vector_results, keyword_results, graph_results)
-        #加权得到最后分数
-        return self._merge_results_score_boost(vector_results, keyword_results, graph_results)
-
-    #这个是个toy logic
-    def _merge_results_score_boost(
-        self,
-        vector_results: List[Dict[str, Any]],
-        keyword_results: List[Dict[str, Any]],
-        graph_results: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Legacy score-boost merge."""
-        result_dict = {}
-        
-        # 1. 向量结果 (Base)
-        for res in vector_results:
-            key = res["payload"].get("chunk_id") or res["id"]
-            res["payload"]["retrieval_type"] = "vector"
-            result_dict[key] = res
-            
-        # 2. 关键词结果 (Boost)
-        for res in keyword_results:
-            key = res["payload"].get("chunk_id") or res["id"]
-            if key in result_dict:
-                # Boost score
-                result_dict[key]["score"] += res["score"] * 0.3
-                result_dict[key]["payload"]["retrieval_type"] = "hybrid"
-            else:
-                res["payload"]["retrieval_type"] = "keyword"
-                result_dict[key] = res
-                
-        # 3. 图谱结果 (Add)
-        # 图谱结果通常不是原始 chunk，而是生成的知识文本
-        for res in graph_results:
-            key = res["id"]
-            res["payload"]["retrieval_type"] = "graph"
-            result_dict[key] = res
-            
-        merged = list(result_dict.values())
-        merged.sort(key=lambda x: x["score"], reverse=True)
-        return merged
+        """合并多种检索结果（RRF 融合）"""
+        return self._merge_results_rrf(vector_results, keyword_results, graph_results)
 
     def _merge_results_rrf(
         self,
@@ -627,11 +563,16 @@ class RAGRetriever:
         keyword_results: List[Dict[str, Any]],
         graph_results: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Reciprocal Rank Fusion across vector, BM25, and graph retrieval."""
+        """Reciprocal Rank Fusion across vector, BM25, and graph retrieval.
+
+        权重调整：vector=1.0（主路），keyword=0.3（辅助），graph=0.2（辅助）
+        原 keyword=0.8 权重过高，在语义改写场景下 BM25 高分噪声会稀释 vector 正确排名。
+        降低后 keyword 只在 vector 也认可的 chunk 上加分，不会单独把噪声推到前面。
+        """
         lists = [
             ("vector", vector_results, 1.0),
-            ("keyword", keyword_results, 0.8),
-            ("graph", graph_results, 0.7),
+            ("keyword", keyword_results, 0.3),
+            ("graph", graph_results, 0.2),
         ]
         return merge_results_rrf(lists)
 
