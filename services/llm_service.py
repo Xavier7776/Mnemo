@@ -212,7 +212,36 @@ class LLMService:
                 f"4. 引用知识时，请尽量自然融入回答中。\n\n"
                 f"【检索知识】\n{context}"
             )
-        
+
+        # MCP compact 模式：注入工具摘要，告知 LLM 已按需加载相关工具
+        try:
+            from services.mcp_client_service import mcp_client_manager
+            if mcp_client_manager.is_enabled and mcp_client_manager.should_use_compact_mode(self.model_name):
+                compact_summary = mcp_client_manager.get_compact_tool_summary()
+                if compact_summary:
+                    system_parts.append(
+                        f"\n【MCP 工具说明（按需加载模式）】\n"
+                        f"当前 MCP 工具数量较多，已启用按需加载模式。\n\n"
+                        f"## 工作方式\n"
+                        f"- 系统**已根据用户问题自动检索**最相关的 MCP 工具，并注入了它们的完整 schema。\n"
+                        f"- 你**直接调用**已注入的 mcp__{{server}}__{{tool}} 工具即可，**无需先调 mcp_list_tools**。\n"
+                        f"- 只有当你需要的工具**不在已注入列表中**时，才调 `mcp_list_tools(server_name)` 查询其他工具。\n\n"
+                        f"## 决策流程\n"
+                        f"1. 查看当前 tools 列表，看是否有匹配用户需求的 mcp__ 工具。\n"
+                        f"2. 如果有：直接调用（按 schema 传参）。\n"
+                        f"3. 如果没有但你确信存在该 MCP 工具：调 mcp_list_tools(server_name) 查询，拿到工具名后调用。\n"
+                        f"4. 如果不需要 MCP 工具（纯对话/知识问答）：直接回答，不要调任何 MCP 工具。\n\n"
+                        f"## 判断示例\n"
+                        f"- 用户问"读取 D:/test.txt" 且 tools 中有 mcp__filesystem__read_file → 直接调用\n"
+                        f"- 用户问"读取 D:/test.txt" 但 tools 中没有 filesystem 工具 → 调 mcp_list_tools(filesystem)\n"
+                        f"- 用户问"你好" → 不需要 MCP 工具 → 直接回答\n"
+                        f"- 用户问"什么是 RAG" → 不需要 MCP 工具（用内置知识或 rag_retrieve）→ 直接回答\n\n"
+                        f"## 全部 MCP 工具摘要（供你判断是否需要调 mcp_list_tools）\n"
+                        f"{compact_summary}"
+                    )
+        except Exception as e:
+            logger.debug(f"注入 MCP compact 摘要失败（非关键路径）: {e}")
+
         system_content = "\n".join(system_parts)
         messages = [{"role": "system", "content": system_content}]
         
@@ -297,9 +326,39 @@ class LLMService:
         )
 
         adapter = self._adapter
-        # 工具 schema 转换：ai_tools 的 JSON Schema -> CanonicalTool -> 厂商特定格式
-        canonical_tools = ToolSchemaConverter.from_ai_tools_schema(ai_tools.get_tools_schema())
-        tools_payload = adapter.convert_tools(canonical_tools)
+
+        # v3 按需加载：compact mode 时按 user query 动态筛选 MCP 工具 schema
+        # 避免把所有 MCP 工具 schema 都塞进 prompt，节省 token + 提升决策准确率
+        from services.mcp_client_service import mcp_client_manager
+        use_compact_mode = (
+            mcp_client_manager.is_enabled
+            and mcp_client_manager.should_use_compact_mode(self.model_name)
+        )
+
+        if use_compact_mode:
+            # 从 messages 中提取 user query（最后一个 user 消息）
+            user_query = ""
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    user_query = (msg.get("content") or "").strip()
+                    break
+            # 按需加载：内置工具 + query 相关的 MCP 工具 + mcp_list_tools 兜底
+            dynamic_schemas = ai_tools.get_dynamic_tools_schema(
+                query=user_query,
+                top_k=5,
+                include_mcp_list_tools=True,
+            )
+            canonical_tools = ToolSchemaConverter.from_ai_tools_schema(dynamic_schemas)
+            tools_payload = adapter.convert_tools(canonical_tools)
+            logger.info(
+                f"v3 按需加载启用: query={user_query[:50]!r}, "
+                f"tools_payload 数量={len(tools_payload)}"
+            )
+        else:
+            # 全量模式：注入所有工具 schema
+            canonical_tools = ToolSchemaConverter.from_ai_tools_schema(ai_tools.get_tools_schema())
+            tools_payload = adapter.convert_tools(canonical_tools)
+
         tool_choice = adapter.convert_tool_choice("auto")
 
         current_messages = list(messages)
@@ -423,6 +482,8 @@ class LLMService:
                             }
                             logger.warning(f"rag_retrieve 达到最大检索次数限制: {max_retrievals}")
                         else:
+                            # 从 tool_execution_context 读取前置 plan（对话路径注入），让工具复用 plan 的 rewritten_queries/final_k 等
+                            tool_plan = tool_execution_context.get("query_plan")
                             result = await ai_tools.rag_retrieve_with_context(
                                 query=params.get("query", ""),
                                 strategy=params.get("strategy", "auto"),
@@ -433,6 +494,7 @@ class LLMService:
                                 knowledge_space_ids=tool_execution_context.get("knowledge_space_ids"),
                                 embedding_model=tool_execution_context.get("embedding_model"),
                                 exclude_chunk_ids=retrieval_ctx.get("seen_chunk_ids", set()),
+                                plan=tool_plan,
                             )
                             # 更新去重状态
                             retrieval_ctx["total_retrieval_count"] = current_count + 1
@@ -634,12 +696,15 @@ class LLMService:
             })
 
             # —— Reflect：反思充分性 ——
+            # 传入 verified_chunks 用于覆盖度分析（增强 rules 模式）
+            verified_chunks_for_reflect = [c for c in collected_evidence if c.get("verified")]
             reflection = await reflector.reflect(
                 query=original_query,
                 observations=obs_list,
-                verified_count=len({c.get("chunk_id") for c in collected_evidence if c.get("verified")}),
+                verified_count=len({c.get("chunk_id") for c in verified_chunks_for_reflect}),
                 total_retrieval_count=retrieval_ctx.get("total_retrieval_count", 0),
                 max_retrievals=retrieval_ctx.get("max_retrievals", 5),
+                verified_chunks=verified_chunks_for_reflect,
             )
             reflection["original_query"] = original_query
 

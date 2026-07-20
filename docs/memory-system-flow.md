@@ -1,4 +1,4 @@
-# Advanced-RAG 记忆系统完整流程
+# Mnemo 记忆系统完整流程
 
 > 日期：2026-07-04  
 > 参考架构：Letta 三层记忆体系
@@ -26,7 +26,7 @@
 
 ### 2.1 数据结构
 
-文件：[models/memory.py](file:///d:/timeModel/advanced-rag/models/memory.py)
+文件：[models/memory.py](file:///d:/timeModel/Mnemo/models/memory.py)
 
 ```python
 class CoreMemoryBlock(BaseModel):
@@ -47,7 +47,7 @@ class CoreMemory(BaseModel):
 
 ### 2.2 读写流程
 
-文件：[services/core_memory_service.py](file:///d:/timeModel/advanced-rag/services/core_memory_service.py)
+文件：[services/core_memory_service.py](file:///d:/timeModel/Mnemo/services/core_memory_service.py)
 
 | 操作 | 方法 | 行号 | 说明 |
 |------|------|------|------|
@@ -59,7 +59,7 @@ class CoreMemory(BaseModel):
 
 ### 2.3 注入时机
 
-文件：[services/prompt_chain.py](file:///d:/timeModel/advanced-rag/services/prompt_chain.py) 第 323-333 行
+文件：[services/prompt_chain.py](file:///d:/timeModel/Mnemo/services/prompt_chain.py) 第 323-333 行
 
 在 `build_prompt_chain` 中，拼接完 `base_prompt + assistant_prompt` 后追加 Core Memory：
 
@@ -84,7 +84,7 @@ if core_memory_text:
 
 ### 3.1 数据结构
 
-文件：[models/memory.py](file:///d:/timeModel/advanced-rag/models/memory.py) 第 38-45 行
+文件：[models/memory.py](file:///d:/timeModel/Mnemo/models/memory.py) 第 38-45 行
 
 ```python
 class ArchivalMemoryItem(BaseModel):
@@ -98,7 +98,7 @@ class ArchivalMemoryItem(BaseModel):
 
 ### 3.2 读写流程
 
-文件：[services/archival_memory_service.py](file:///d:/timeModel/advanced-rag/services/archival_memory_service.py)
+文件：[services/archival_memory_service.py](file:///d:/timeModel/Mnemo/services/archival_memory_service.py)
 
 | 操作 | 方法 | 行号 | 说明 |
 |------|------|------|------|
@@ -122,14 +122,14 @@ class ArchivalMemoryItem(BaseModel):
 
 ### 4.1 触发条件
 
-文件：[services/memory_summarizer.py](file:///d:/timeModel/advanced-rag/services/memory_summarizer.py)
+文件：[services/memory_summarizer.py](file:///d:/timeModel/Mnemo/services/memory_summarizer.py)
 
 ```python
 TRIGGER_MESSAGE_COUNT = 30  # 超过 30 条消息触发
 KEEP_RECENT = 8             # 摘要后保留最近 8 条原文
 ```
 
-触发位置：[routers/chat.py](file:///d:/timeModel/advanced-rag/routers/chat.py) 第 451-462 行，在 `add_message` 端点中通过 `BackgroundTasks` 后台触发，不阻塞主流程。
+触发位置：[routers/chat.py](file:///d:/timeModel/Mnemo/routers/chat.py) 第 451-462 行，在 `add_message` 端点中通过 `BackgroundTasks` 后台触发，不阻塞主流程。
 
 ### 4.2 摘要策略
 
@@ -145,7 +145,7 @@ KEEP_RECENT = 8             # 摘要后保留最近 8 条原文
 
 ## 五、记忆相关工具
 
-文件：[services/ai_tools.py](file:///d:/timeModel/advanced-rag/services/ai_tools.py)
+文件：[services/ai_tools.py](file:///d:/timeModel/Mnemo/services/ai_tools.py)
 
 | 工具名 | 行号 | 参数 | 作用 |
 |--------|------|------|------|
@@ -288,15 +288,15 @@ routers/chat.py
 
 | 文件 | 职责 |
 |------|------|
-| [models/memory.py](file:///d:/timeModel/advanced-rag/models/memory.py) | 三层记忆数据模型 |
-| [core_memory_service.py](file:///d:/timeModel/advanced-rag/services/core_memory_service.py) | Core Memory 读写 + 渲染，存 MongoDB |
-| [archival_memory_service.py](file:///d:/timeModel/advanced-rag/services/archival_memory_service.py) | Archival Memory 向量化插入 + 语义检索，存 Qdrant |
-| [memory_summarizer.py](file:///d:/timeModel/advanced-rag/services/memory_summarizer.py) | 超长对话摘要化（>30条触发，保留8条） |
-| [prompt_chain.py](file:///d:/timeModel/advanced-rag/services/prompt_chain.py) | base_prompt + assistant_prompt + Core Memory 注入 |
-| [llm_service.py](file:///d:/timeModel/advanced-rag/services/llm_service.py) | 构建 messages、流式生成 + 工具调用循环（max 4轮） |
-| [ai_tools.py](file:///d:/timeModel/advanced-rag/services/ai_tools.py) | 注册 9 个工具（5个记忆 + 4个系统查询） |
-| [chat.py](file:///d:/timeModel/advanced-rag/routers/chat.py) | HTTP 端点、读取 Recall Memory、SSE 转发、持久化、后台摘要 |
-| [general_assistant_agent.py](file:///d:/timeModel/advanced-rag/agents/general_assistant/general_assistant_agent.py) | RAG 检索 + LLM 生成编排、解析工具调用事件 |
+| [models/memory.py](file:///d:/timeModel/Mnemo/models/memory.py) | 三层记忆数据模型 |
+| [core_memory_service.py](file:///d:/timeModel/Mnemo/services/core_memory_service.py) | Core Memory 读写 + 渲染，存 MongoDB |
+| [archival_memory_service.py](file:///d:/timeModel/Mnemo/services/archival_memory_service.py) | Archival Memory 向量化插入 + 语义检索，存 Qdrant |
+| [memory_summarizer.py](file:///d:/timeModel/Mnemo/services/memory_summarizer.py) | 超长对话摘要化（>30条触发，保留8条） |
+| [prompt_chain.py](file:///d:/timeModel/Mnemo/services/prompt_chain.py) | base_prompt + assistant_prompt + Core Memory 注入 |
+| [llm_service.py](file:///d:/timeModel/Mnemo/services/llm_service.py) | 构建 messages、流式生成 + 工具调用循环（max 4轮） |
+| [ai_tools.py](file:///d:/timeModel/Mnemo/services/ai_tools.py) | 注册 9 个工具（5个记忆 + 4个系统查询） |
+| [chat.py](file:///d:/timeModel/Mnemo/routers/chat.py) | HTTP 端点、读取 Recall Memory、SSE 转发、持久化、后台摘要 |
+| [general_assistant_agent.py](file:///d:/timeModel/Mnemo/agents/general_assistant/general_assistant_agent.py) | RAG 检索 + LLM 生成编排、解析工具调用事件 |
 
 ---
 

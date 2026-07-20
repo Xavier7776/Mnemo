@@ -85,6 +85,8 @@ class RAGRetriever:
         graph_enabled: Optional[bool] = None,
         strategy: str = "auto",
         exclude_chunk_ids: Optional[set] = None,
+        enable_query_rewrite: bool = False,
+        enable_hyde: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         异步检索相关文档块 (High-level RAG)
@@ -101,6 +103,8 @@ class RAGRetriever:
                 - "keyword": 仅 BM25 关键词检索
                 - "graph": 仅图谱检索
             exclude_chunk_ids: 需要排除的 chunk_id 集合（用于 Agent 跨轮次去重）
+            enable_query_rewrite: Phase 1 优化 - 启用 LLM 同义改写（生成 3 个变体并行检索）
+            enable_hyde: Phase 1 优化 - 启用 HyDE（LLM 生成假想答案，用答案做向量检索）
         Returns:
             检索结果列表，包含文本、相似度分数、元数据等
         """
@@ -124,10 +128,25 @@ class RAGRetriever:
             modules = {}
 
         if graph_enabled is None:
-            # 同时检查 runtime_config 和 NEO4J_ENABLED 环境变量
-            # NEO4J_ENABLED=false 时直接禁用图谱检索，避免每题浪费 ~18s 调用空图谱
             neo4j_enabled = os.getenv("NEO4J_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
             graph_enabled = neo4j_enabled and bool(modules.get("kg_retrieve_enabled", True)) and use_graph
+
+        # Phase 1 优化：LLM Query 改写（生成同义变体）
+        if enable_query_rewrite and query_variants is None:
+            try:
+                query_variants = await self._rewrite_query_llm(query)
+            except Exception as e:
+                logger.warning(f"LLM Query 改写失败，使用原始 query: {e}")
+                query_variants = None
+
+        # Phase 1 优化：HyDE（生成假想答案用于向量检索）
+        hyde_doc = None
+        if enable_hyde and use_vector:
+            try:
+                hyde_doc = await self._generate_hyde(query)
+            except Exception as e:
+                logger.warning(f"HyDE 生成失败，跳过: {e}")
+                hyde_doc = None
 
         # 1. 并行执行多种检索策略（按 strategy 选择性启用）
         queries = [q for q in (query_variants or [query]) if q and q.strip()]
@@ -142,6 +161,11 @@ class RAGRetriever:
                 self._vector_search(q, document_id, collection_name, embedding_model)
                 for q in queries
             ]
+            # Phase 1 优化：HyDE 假想答案额外做一路向量检索
+            if hyde_doc:
+                vector_tasks.append(
+                    self._vector_search(hyde_doc, document_id, collection_name, embedding_model)
+                )
             tasks.append(asyncio.gather(*vector_tasks))
             task_names.append("vector")
 
@@ -201,8 +225,14 @@ class RAGRetriever:
         # 3. 重排 (Rerank)
         reranker = self._get_reranker()
         if reranker and merged_results:
+            # Phase 4 优化：reranker 之前先 RRF 截取 top-N
+            # 原逻辑：reranker 对全部 merged_results 打分（prefetch_k=200 时几百个候选，极慢）
+            # 新逻辑：混合检索+RRF 融合后截取 top-N（默认 20），只对这 N 个候选 reranker
+            rerank_candidate_k = int(os.getenv("RERANK_CANDIDATE_K", "20"))
+            candidates_for_rerank = merged_results[:rerank_candidate_k]
+            logger.debug(f"reranker 候选集: {len(merged_results)} -> {len(candidates_for_rerank)}")
             #把分数修改,改为更精确的cross-encoder计算出来的
-            reranked_results = await self._rerank(query, merged_results, reranker=reranker)
+            reranked_results = await self._rerank(query, candidates_for_rerank, reranker=reranker)
             # 在线动态裁剪 k：基于重排分数分布自适应（兼顾 recall/precision）
             #这个很好,判断gap大不大也就是后面的和前面的关联度大不大,如果不大那就只取前面几个的
             #如果差距很小那就都取几个交给LLM去判断
@@ -241,6 +271,85 @@ class RAGRetriever:
                 k = min(k_max, max(k, 24))
 
         return max(k_min, min(k_max, k))
+
+    # ==================== Phase 1: LLM Query 改写 + HyDE ====================
+
+    async def _rewrite_query_llm(self, query: str) -> List[str]:
+        """Phase 1 优化：LLM 同义改写 query，生成 3 个变体
+
+        策略：
+        1. 调用 LLM 生成 3 个同义改写（不同表达方式、不同术语）
+        2. 加上原始 query，共 4 个变体并行检索
+        3. RRF 融合后取最优
+
+        适用场景：用户 query 口语化、术语不全、与文档表达差距大
+        """
+        from utils.llm_client import get_async_openai_client
+
+        model = os.getenv("LLM_MODEL", "mimo-v2.5").strip()
+        timeout = float(os.getenv("QUERY_REWRITE_TIMEOUT", "30.0"))
+
+        prompt = f"""你是一个检索查询改写器。把下面的用户查询改写成 3 个不同表达方式的同义查询，用于提升检索召回率。
+
+要求：
+1. 保留核心语义，改变表达方式
+2. 第 1 个：用更正式/学术的表达
+3. 第 2 个：用更口语化的表达
+4. 第 3 个：补充相关术语或同义词
+5. 每个改写不超过 50 字
+6. 只输出改写后的查询，每行一个，不要编号不要解释
+
+用户查询：{query}
+
+改写："""
+
+        client = get_async_openai_client()
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=300,
+            timeout=timeout,
+        )
+        text = response.choices[0].message.content or ""
+        variants = [line.strip() for line in text.split("\n") if line.strip()][:3]
+        # 加上原始 query
+        variants = [query] + variants
+        logger.info(f"[Phase1] Query 改写: {variants}")
+        return variants
+
+    async def _generate_hyde(self, query: str) -> Optional[str]:
+        """Phase 1 优化：HyDE - LLM 生成假想答案，用答案做向量检索
+
+        原理：用户 query 通常短、模糊，与文档表达差距大。
+        让 LLM 先生成一个"假想答案"，答案的语义分布更接近文档，向量检索召回更高。
+
+        适用场景：query 短、模糊、口语化；文档长、正式、术语密集
+        """
+        from utils.llm_client import get_async_openai_client
+
+        model = os.getenv("LLM_MODEL", "mimo-v2.5").strip()
+        timeout = float(os.getenv("HYDE_TIMEOUT", "30.0"))
+
+        prompt = f"""请简要回答以下问题（即使你不确定，也要给出一个 plausible 的答案，200 字以内）：
+
+问题：{query}
+
+回答："""
+
+        client = get_async_openai_client()
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=400,
+            timeout=timeout,
+        )
+        hyde_doc = (response.choices[0].message.content or "").strip()
+        if len(hyde_doc) < 10:
+            return None
+        logger.info(f"[Phase1] HyDE 生成 ({len(hyde_doc)} 字): {hyde_doc[:100]}...")
+        return hyde_doc
 
     # # groups 是多个结果列表组成的列表
     # groups = [
@@ -301,12 +410,18 @@ class RAGRetriever:
             return []
 
     async def _keyword_search(self, query: str, document_id: Optional[str]) -> List[Dict[str, Any]]:
-        """关键词检索 — 优先 Redis 倒排索引，fallback 到 MongoDB 全表扫描（阶段二改造）"""
-        query_terms = self._tokenize(query)
+        """关键词检索 — 优先 Redis 倒排索引（停用词过滤），fallback 到 MongoDB 全表扫描"""
+        # 查询端必须过滤停用词，否则 "是/用/什么/的" 等高频虚词会淹没 BM25 结果
+        # 之前的 BUG：用了 tokenize（索引端版本，不过滤停用词），导致 keyword recall@5 从 0.3 跌到 0.007
+        from utils.tokenizer import tokenize_for_query
+        query_terms = tokenize_for_query(query)
         if not query_terms:
             return []
 
         # —— 优先尝试 Redis 倒排索引 ——
+        # BUG 修复：原代码 fallback 是静默的，导致 keyword 策略实际走 MongoDB 全表扫描
+        # 时延迟从 ~33ms 退化到 ~780ms 也不打日志，无法定位问题。
+        # 现在所有 fallback 路径都打 WARNING 日志，便于排查 RediSearch 是否真正生效。
         try:
             from utils.redis_client import search_bm25, is_available
             if is_available():
@@ -314,14 +429,26 @@ class RAGRetriever:
                     search_bm25, query_terms, self.prefetch_k, document_id
                 )
                 if id_score_pairs:
-                    # Redis 返回 (chunk_id, score) 列表，从 MongoDB 回查 chunk text
                     chunks = await asyncio.to_thread(self._fetch_chunks_by_ids, id_score_pairs)
                     if chunks:
                         logger.debug(f"Redis BM25 命中: {len(chunks)} 个 chunk (query='{query[:30]}')")
                         return chunks
-                # Redis 无结果，继续 fallback 到 MongoDB
+                    logger.warning(
+                        f"Redis BM25 返回 {len(id_score_pairs)} 个 id 但 MongoDB 回查 0 chunk，"
+                        f"fallback 到 MongoDB 全表扫描 (query='{query[:30]}')"
+                    )
+                else:
+                    logger.warning(
+                        f"Redis BM25 返回空（RediSearch 可用但无匹配或索引为空），"
+                        f"fallback 到 MongoDB 全表扫描 (query='{query[:30]}')"
+                    )
+            else:
+                logger.warning(
+                    f"Redis/RediSearch 不可用（is_available=False），"
+                    f"fallback 到 MongoDB 全表扫描 (query='{query[:30]}')"
+                )
         except Exception as e:
-            logger.warning(f"Redis BM25 检索失败，fallback 到 MongoDB: {e}")
+            logger.warning(f"Redis BM25 检索异常，fallback 到 MongoDB: {e}")
 
         # —— Fallback: 原有 MongoDB 全表扫描逻辑 ——
         return await self._keyword_search_mongo(query, document_id)
@@ -437,14 +564,18 @@ class RAGRetriever:
             return []
 
     def _tokenize(self, text: str) -> List[str]:
-        clean = (text or "").lower()
-        try:
-            import jieba  # type: ignore
-            #"信息检索技术" → ["信息", "检索", "技术"]
-            tokens = [t.strip() for t in jieba.cut(clean) if t.strip()]
-        except Exception:
-            tokens = re.findall(r"[\w\u4e00-\u9fff]+", clean)
-        return [t for t in tokens if len(t) > 1 or re.match(r"[\u4e00-\u9fff]", t)]
+        # Phase 3 优化：统一走 utils/tokenizer.py，支持驼峰切分 + 专有名词词典
+        # 注意：查询端用 tokenize（不过滤停用词），避免破坏中文匹配
+        from utils.tokenizer import tokenize
+        return tokenize(text)
+
+    def _tokenize_weighted(self, text: str):
+        """Phase 3 优化：查询端加权分词（英文 token 权重更高）
+
+        返回 [(token, weight), ...]，供 BM25 加权查询使用。
+        """
+        from utils.tokenizer import tokenize_for_query_weighted
+        return tokenize_for_query_weighted(text)
 
     def _candidate_chunks_for_keyword(self, query: str, limit: int = 1200) -> List[Dict[str, Any]]:
         terms = self._tokenize(query)[:8]
@@ -565,14 +696,23 @@ class RAGRetriever:
     ) -> List[Dict[str, Any]]:
         """Reciprocal Rank Fusion across vector, BM25, and graph retrieval.
 
-        权重调整：vector=1.0（主路），keyword=0.3（辅助），graph=0.2（辅助）
-        原 keyword=0.8 权重过高，在语义改写场景下 BM25 高分噪声会稀释 vector 正确排名。
-        降低后 keyword 只在 vector 也认可的 chunk 上加分，不会单独把噪声推到前面。
+        权重通过环境变量配置，便于消融实验：
+        - RRF_WEIGHT_VECTOR（默认 1.0，主路）
+        - RRF_WEIGHT_KEYWORD（默认 0.3，辅助；原 0.8 过高会让 BM25 噪声稀释 vector）
+        - RRF_WEIGHT_GRAPH（默认 0.2，辅助）
+
+        消融实验配置示例：
+        - 等权 RRF: RRF_WEIGHT_VECTOR=1.0 RRF_WEIGHT_KEYWORD=1.0 RRF_WEIGHT_GRAPH=1.0
+        - vector 主导: RRF_WEIGHT_VECTOR=1.0 RRF_WEIGHT_KEYWORD=0.1 RRF_WEIGHT_GRAPH=0.1
+        - 纯 vector: RRF_WEIGHT_VECTOR=1.0 RRF_WEIGHT_KEYWORD=0.0 RRF_WEIGHT_GRAPH=0.0
         """
+        w_vector = float(os.getenv("RRF_WEIGHT_VECTOR", "1.0"))
+        w_keyword = float(os.getenv("RRF_WEIGHT_KEYWORD", "0.3"))
+        w_graph = float(os.getenv("RRF_WEIGHT_GRAPH", "0.2"))
         lists = [
-            ("vector", vector_results, 1.0),
-            ("keyword", keyword_results, 0.3),
-            ("graph", graph_results, 0.2),
+            ("vector", vector_results, w_vector),
+            ("keyword", keyword_results, w_keyword),
+            ("graph", graph_results, w_graph),
         ]
         return merge_results_rrf(lists)
 

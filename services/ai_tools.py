@@ -266,11 +266,64 @@ class AITools:
     def get_tools_schema(self) -> List[Dict[str, Any]]:
         """
         获取所有工具的JSON Schema定义
-        
+
         Returns:
             工具列表（OpenAI Function Calling格式）
         """
         return list(self.tools.values())
+
+    def get_dynamic_tools_schema(
+        self,
+        query: str,
+        top_k: int = 5,
+        include_mcp_list_tools: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """v3 按需加载：返回内置工具 + 与 query 相关的 MCP 工具 schema
+
+        compact mode 下替代 get_tools_schema()，避免把所有 MCP 工具 schema 都塞进 prompt。
+        流程：
+            1. 取所有内置工具 schema（self.tools 中非 mcp__ 前缀的）
+            2. 调 mcp_client_manager.get_relevant_tool_schemas(query, top_k) 取相关 MCP 工具
+            3. 可选加上 mcp_list_tools 元工具（兜底，让 LLM 能查询其他工具）
+
+        Args:
+            query: 用户查询
+            top_k: 检索的 MCP 工具数量（建议 3~10）
+            include_mcp_list_tools: 是否包含 mcp_list_tools 元工具作为兜底
+
+        Returns:
+            工具 schema 列表（OpenAI Function Calling 格式）
+        """
+        schemas: List[Dict[str, Any]] = []
+
+        # 1. 内置工具（非 mcp__ 前缀的工具）
+        for tool_schema in self.tools.values():
+            name = tool_schema.get("name", "")
+            if not name.startswith("mcp__") and name != "mcp_list_tools":
+                schemas.append(tool_schema)
+
+        # 2. 按 query 检索相关 MCP 工具
+        try:
+            from services.mcp_client_service import mcp_client_manager
+            if mcp_client_manager.is_enabled:
+                relevant_mcp_tools = mcp_client_manager.get_relevant_tool_schemas(query, top_k=top_k)
+                schemas.extend(relevant_mcp_tools)
+        except Exception as e:
+            logger.warning(f"get_dynamic_tools_schema: 检索 MCP 工具失败，仅返回内置工具: {e}")
+
+        # 3. 兜底元工具：mcp_list_tools（让 LLM 在检索结果不准时能主动查询）
+        if include_mcp_list_tools:
+            list_tools_schema = self.tools.get("mcp_list_tools")
+            if list_tools_schema:
+                schemas.append(list_tools_schema)
+
+        logger.info(
+            f"get_dynamic_tools_schema: query={query!r}, "
+            f"内置={len([s for s in schemas if not s.get('name', '').startswith('mcp__') and s.get('name') != 'mcp_list_tools'])}, "
+            f"MCP相关={len([s for s in schemas if s.get('name', '').startswith('mcp__')])}, "
+            f"总计={len(schemas)}"
+        )
+        return schemas
     
     def _filter_tool_arguments(self, name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """只保留该工具 schema 中声明的参数，忽略模型误传的占位符（如 参数名、参数值）"""
@@ -375,19 +428,49 @@ class AITools:
             logger.error(f"调用工具函数 {name} 失败: {str(e)}", exc_info=True)
             raise
 
-    def register_mcp_tools(self, manager) -> int:
+    def register_mcp_tools(self, manager, force_compact: Optional[bool] = None, model_name: Optional[str] = None) -> int:
         """将 MCP Server 的工具动态注册为 ai_tools
 
         Args:
             manager: MCPClientManager 实例
+            force_compact: 强制指定 compact 模式
+                - True：只注册 mcp_list_tools 元工具（不注册具体 MCP 工具）
+                - False：注册全部 MCP 工具（全量模式）
+                - None：根据 manager.should_use_compact_mode(model_name) 自动判断
+            model_name: LLM 模型名（如 "mimo-v2.5"），用于按 context window 自适应阈值。
+                None 时从环境变量 LLM_MODEL 读取，再不行则用默认阈值 TOOL_COUNT_THRESHOLD。
 
         Returns:
-            注册的工具数量
+            注册的工具数量（compact 模式下返回 1，即 mcp_list_tools 元工具）
+
+        compact 模式设计：
+        - v3: 工具数 > 自适应阈值时启用（8K→15, 16K→18, 32K→22, 64K→28, 128K→35, >128K→40）
+        - tools_payload 里不包含具体 MCP 工具 schema，只含 mcp_list_tools 元工具
+        - LLM 通过 mcp_list_tools 查询具体工具后再调用 mcp__{server}__{tool}
+        - 优势：大幅降低 prompt token（10 个工具 vs 100 个工具的 schema 差异巨大）
+        - 代价：LLM 多一次 mcp_list_tools 调用，决策延迟略增
         """
         if not manager.is_enabled:
             logger.info("MCP 未启用或未初始化，跳过 MCP 工具注册")
             return 0
 
+        # 自动获取 model_name（从环境变量兜底）
+        if model_name is None:
+            model_name = os.getenv("LLM_MODEL")
+
+        # 判断是否启用 compact 模式（按 model_name 自适应阈值）
+        use_compact = force_compact if force_compact is not None else manager.should_use_compact_mode(model_name)
+
+        if use_compact:
+            # compact 模式：只注册 mcp_list_tools 元工具
+            registered = self._register_mcp_list_tools_meta(manager)
+            logger.info(
+                f"MCP compact 模式启用（共 {manager.total_tool_count} 个工具 > 阈值，model={model_name or 'default'}），"
+                f"只注册 mcp_list_tools 元工具，LLM 通过它发现具体工具"
+            )
+            return registered
+
+        # 全量模式：注册所有 MCP 工具
         tool_map = manager.get_tool_map()
         all_tools = manager.get_all_tools()
         registered = 0
@@ -411,8 +494,62 @@ class AITools:
             self._async_tools[tool_name] = wrapper
             registered += 1
 
-        logger.info(f"MCP 工具注册完成: {registered} 个工具")
+        logger.info(f"MCP 工具注册完成（全量模式）: {registered} 个工具")
         return registered
+
+    def _register_mcp_list_tools_meta(self, manager) -> int:
+        """注册 mcp_list_tools 元工具 + 所有 MCP 工具 wrapper（compact 模式专用）
+
+        v3 调整：compact mode 现在走"按需加载"路径（ToolIndex 检索相关工具直接注入 schema），
+        此方法仍负责：
+        1. 注册所有 MCP 工具的 wrapper 到 async_tools（不进 tools schema）
+           — 这样 LLM 调用任意检索出来的 MCP 工具时，async_call_tool 仍能找到 wrapper 执行
+        2. 注册 mcp_list_tools 元工具到 tools schema（作为兜底）
+           — 当 ToolIndex 检索结果不准或 LLM 想看完整工具列表时使用
+
+        关键设计：wrapper 全量注册到 async_tools 保证可执行，但 tools schema 只在
+        get_dynamic_tools_schema(query) 时按需取出，避免 prompt 膨胀。
+        """
+        # 1. 注册所有 MCP 工具的 wrapper 到 async_tools（不进 tools schema）
+        tool_map = manager.get_tool_map()
+        all_tools = manager.get_all_tools()
+        self._get_async_tools()  # 触发懒加载
+
+        for tool_schema in all_tools:
+            tool_name = tool_schema["name"]
+            server_name, original_name = tool_map[tool_name]
+            wrapper = self._make_mcp_tool_wrapper(manager, server_name, original_name)
+            # 只注册到 async_tools，不注册到 self.tools（不进 tools_payload）
+            self._async_tools[tool_name] = wrapper
+            # 同时注册到 self.functions（async_call_tool 走 self.functions 校验）
+            self.functions[tool_name] = wrapper
+
+        # 2. 注册 mcp_list_tools 元工具（作为兜底，让 LLM 能主动查询未检索到的工具）
+        async def mcp_list_tools(server_name: Optional[str] = None, **_):
+            """元工具：列出 MCP 工具详情"""
+            result = await manager.list_tools_detail(server_name)
+            return result
+
+        self.register_tool(
+            name="mcp_list_tools",
+            description=(
+                "列出可用的 MCP 工具详情（兜底用）。当系统已按需注入工具 schema 但你仍需要"
+                "查询其他未注入的工具时调用。可选传入 server_name 只查某个 Server 的工具。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "server_name": {
+                        "type": "string",
+                        "description": "可选，指定 Server 名称（如 filesystem/firecrawl-mcp/time）。不传则返回所有 Server 的工具。",
+                    },
+                },
+                "required": [],
+            },
+            function=mcp_list_tools,
+        )
+        self._async_tools["mcp_list_tools"] = mcp_list_tools
+        return 1
 
     @staticmethod
     def _make_mcp_tool_wrapper(manager, server_name: str, tool_name: str):
@@ -455,6 +592,7 @@ class AITools:
         knowledge_space_ids: Optional[list] = None,
         embedding_model: Optional[str] = None,
         exclude_chunk_ids: Optional[set] = None,
+        plan: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         rag_retrieve 工具的真正 async 实现，由 llm_service 直接调用。
@@ -470,6 +608,7 @@ class AITools:
             knowledge_space_ids: 知识空间ID列表（系统注入）
             embedding_model: 向量模型名（系统注入）
             exclude_chunk_ids: 需排除的chunk_id集合（系统注入，跨轮次去重）
+            plan: 可选的 QueryPlan 对象，若提供则复用（避免重复规划）
         """
         from services.rag_service import rag_service
 
@@ -484,6 +623,7 @@ class AITools:
                 top_k=top_k,
                 min_score=min_score,
                 exclude_chunk_ids=exclude_chunk_ids,
+                plan=plan,
             )
 
             evidence = result.get("evidence", [])
@@ -727,12 +867,12 @@ class AITools:
                     assistant_collection = mongodb.get_collection("course_assistants")
                     assistant_doc = await assistant_collection.find_one({"_id": assistant_id})
                     if assistant_doc:
-                        collection_name = assistant_doc.get("collection_name", "advanced_rag_knowledge")
+                        collection_name = assistant_doc.get("collection_name", "mnemo_knowledge")
                         qdrant = get_qdrant_client(collection_name)
                         info = await asyncio.to_thread(qdrant.get_collection_info)
                         total_vectors = info.get("points_count", 0)
                 else:
-                    qdrant = get_qdrant_client("advanced_rag_knowledge")
+                    qdrant = get_qdrant_client("mnemo_knowledge")
                     info = await asyncio.to_thread(qdrant.get_collection_info)
                     total_vectors = info.get("points_count", 0)
             except Exception as e:

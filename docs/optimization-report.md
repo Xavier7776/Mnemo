@@ -1,4 +1,4 @@
-# Advanced-RAG 性能优化报告
+# Mnemo 性能优化报告
 
 > 日期：2026-07-04  
 > 版本：v1.0  
@@ -24,7 +24,7 @@
 
 **问题**：当 LLM 的一个 delta 同时包含 `<function_calls>` 标签前的正常文本和标签本身时（如 `"根据查询结果<function_calls>..."`），代码直接 `continue` 跳过 `yield`，导致标签前的文本被永久丢弃。
 
-**文件**：[services/llm_service.py](file:///d:/timeModel/advanced-rag/services/llm_service.py)
+**文件**：[services/llm_service.py](file:///d:/timeModel/Mnemo/services/llm_service.py)
 
 **修改**：
 ```python
@@ -65,7 +65,7 @@ if tool_call_start in full_response:
 
 **问题**：检测 `'\x1e' not in buffer_chunk` 过于宽泛，若 LLM 输出中出现孤立的 `\x1e` 字节，后续文本会被滞留。
 
-**文件**：[agents/general_assistant/general_assistant_agent.py](file:///d:/timeModel/advanced-rag/agents/general_assistant/general_assistant_agent.py)
+**文件**：[agents/general_assistant/general_assistant_agent.py](file:///d:/timeModel/Mnemo/agents/general_assistant/general_assistant_agent.py)
 
 **修改**：
 ```python
@@ -78,7 +78,7 @@ if stream and buffer_chunk and '\x1eTOOL_CALL:' not in buffer_chunk:
 
 ### 2.5 Import 规范
 
-**文件**：[agents/general_assistant/general_assistant_agent.py](file:///d:/timeModel/advanced-rag/agents/general_assistant/general_assistant_agent.py)
+**文件**：[agents/general_assistant/general_assistant_agent.py](file:///d:/timeModel/Mnemo/agents/general_assistant/general_assistant_agent.py)
 
 **修改**：
 - `import re`、`import json` 移到文件顶部
@@ -92,7 +92,7 @@ if stream and buffer_chunk and '\x1eTOOL_CALL:' not in buffer_chunk:
 
 **问题**：`_generate_once` 和 `list_models` 仍使用同步客户端，阻塞事件循环。
 
-**文件**：[services/llm_service.py](file:///d:/timeModel/advanced-rag/services/llm_service.py)
+**文件**：[services/llm_service.py](file:///d:/timeModel/Mnemo/services/llm_service.py)
 
 **修改**：
 ```python
@@ -107,7 +107,7 @@ response = await self.async_client.chat.completions.create(...)
 
 **问题**：每次请求都查询 DB 获取 base_prompt 和 core_memory，增加 2 次 RTT。
 
-**文件**：[services/llm_service.py](file:///d:/timeModel/advanced-rag/services/llm_service.py)
+**文件**：[services/llm_service.py](file:///d:/timeModel/Mnemo/services/llm_service.py)
 
 **修改**：
 ```python
@@ -130,7 +130,7 @@ if assistant_id is None:
 
 **问题**：对 1200 个候选 chunk 分词两次（一次算 avgdl，一次打分），CPU 浪费。
 
-**文件**：[retrieval/rag_retriever.py](file:///d:/timeModel/advanced-rag/retrieval/rag_retriever.py)
+**文件**：[retrieval/rag_retriever.py](file:///d:/timeModel/Mnemo/retrieval/rag_retriever.py)
 
 **修改**：先一次性分词所有 chunk，复用结果计算 avgdl 和打分。
 
@@ -138,7 +138,7 @@ if assistant_id is None:
 
 **问题**：`_graph_search` 中 `self.chunk_repo.get_chunk_by_id` 是同步调用，且对每个 chunk_id 串行查询（N+1）。
 
-**文件**：[retrieval/rag_retriever.py](file:///d:/timeModel/advanced-rag/retrieval/rag_retriever.py)
+**文件**：[retrieval/rag_retriever.py](file:///d:/timeModel/Mnemo/retrieval/rag_retriever.py)
 
 **修改**：
 1. 收集所有 chunk_ids
@@ -149,7 +149,7 @@ if assistant_id is None:
 
 **问题**：`async_call_tool` 每次调用都重建 `async_tools` 字典（9 个 lambda），并重复 import 两个 service。
 
-**文件**：[services/ai_tools.py](file:///d:/timeModel/advanced-rag/services/ai_tools.py)
+**文件**：[services/ai_tools.py](file:///d:/timeModel/Mnemo/services/ai_tools.py)
 
 **修改**：
 ```python
@@ -168,7 +168,7 @@ def _get_async_tools(self):
 
 **问题**：`_aget_knowledge_base_stats` 中 `qdrant.get_collection_info()` 是同步 gRPC 调用。
 
-**文件**：[services/ai_tools.py](file:///d:/timeModel/advanced-rag/services/ai_tools.py)
+**文件**：[services/ai_tools.py](file:///d:/timeModel/Mnemo/services/ai_tools.py)
 
 **修改**：
 ```python
@@ -179,7 +179,7 @@ total_vectors = await asyncio.to_thread(qdrant.get_collection_info).get("points_
 
 **问题**：Embedding 模型懒加载，首次查询需下载/加载模型（~100MB，数秒）。
 
-**文件**：[utils/lifespan.py](file:///d:/timeModel/advanced-rag/utils/lifespan.py)
+**文件**：[utils/lifespan.py](file:///d:/timeModel/Mnemo/utils/lifespan.py)
 
 **修改**：
 ```python
@@ -191,7 +191,7 @@ await asyncio.to_thread(embedding_service._get_model)
 
 **问题**：`add_message` 中刚 `update_one` 完又 `find_one` 拉取整个文档，仅为获取 title。
 
-**文件**：[routers/chat.py](file:///d:/timeModel/advanced-rag/routers/chat.py)
+**文件**：[routers/chat.py](file:///d:/timeModel/Mnemo/routers/chat.py)
 
 **修改**：复用前面已查询的 `doc` 变量。
 
@@ -199,7 +199,7 @@ await asyncio.to_thread(embedding_service._get_model)
 
 **问题**：每次标题生成都新建 `ThreadPoolExecutor`。
 
-**文件**：[routers/chat.py](file:///d:/timeModel/advanced-rag/routers/chat.py)
+**文件**：[routers/chat.py](file:///d:/timeModel/Mnemo/routers/chat.py)
 
 **修改**：用 `asyncio.to_thread` 替代新建线程池。
 
@@ -211,7 +211,7 @@ await asyncio.to_thread(embedding_service._get_model)
 
 **问题**：`timestamp: new Date().toISOString()` 每次 render 都生成新值，导致 React 认为是新元素，每 chunk 卸载重建 MessageBubble。
 
-**文件**：[web-tanstack/src/components/chat/chat-playground.tsx](file:///d:/timeModel/advanced-rag/web-tanstack/src/components/chat/chat-playground.tsx)
+**文件**：[web-tanstack/src/components/chat/chat-playground.tsx](file:///d:/timeModel/Mnemo/web-tanstack/src/components/chat/chat-playground.tsx)
 
 **修改**：
 ```tsx
@@ -228,7 +228,7 @@ timestamp: draftTimestampRef.current
 
 **问题**：MessageBubble、ToolCallChain、ToolCallItem、SourceList、CopyButton 未 memo，流式期间全量 diff。
 
-**文件**：[web-tanstack/src/components/chat/chat-playground.tsx](file:///d:/timeModel/advanced-rag/web-tanstack/src/components/chat/chat-playground.tsx)
+**文件**：[web-tanstack/src/components/chat/chat-playground.tsx](file:///d:/timeModel/Mnemo/web-tanstack/src/components/chat/chat-playground.tsx)
 
 **修改**：
 ```tsx
@@ -243,7 +243,7 @@ const CopyButton = memo(function CopyButton(...) { ... })
 
 **问题**：`messages`、`allMessages`、`stripToolCalls(draftAnswer)` 每次渲染重算。
 
-**文件**：[web-tanstack/src/components/chat/chat-playground.tsx](file:///d:/timeModel/advanced-rag/web-tanstack/src/components/chat/chat-playground.tsx)
+**文件**：[web-tanstack/src/components/chat/chat-playground.tsx](file:///d:/timeModel/Mnemo/web-tanstack/src/components/chat/chat-playground.tsx)
 
 **修改**：
 ```tsx
@@ -258,7 +258,7 @@ const allMessages = useMemo<ConversationMessage[]>(..., [messages, cleanedDraft,
 
 **问题**：每个 chunk 都触发滚动，无节流，不响应用户上滑。
 
-**文件**：[web-tanstack/src/components/chat/chat-playground.tsx](file:///d:/timeModel/advanced-rag/web-tanstack/src/components/chat/chat-playground.tsx)
+**文件**：[web-tanstack/src/components/chat/chat-playground.tsx](file:///d:/timeModel/Mnemo/web-tanstack/src/components/chat/chat-playground.tsx)
 
 **修改**：
 ```tsx
@@ -282,7 +282,7 @@ useEffect(() => {
 
 **问题**：组件卸载时未 abort 流式请求，浪费 LLM 费用。
 
-**文件**：[web-tanstack/src/components/chat/chat-playground.tsx](file:///d:/timeModel/advanced-rag/web-tanstack/src/components/chat/chat-playground.tsx)
+**文件**：[web-tanstack/src/components/chat/chat-playground.tsx](file:///d:/timeModel/Mnemo/web-tanstack/src/components/chat/chat-playground.tsx)
 
 **修改**：
 ```tsx
@@ -297,7 +297,7 @@ useEffect(() => {
 
 **问题**：用户主动停止却看到红色错误提示。
 
-**文件**：[web-tanstack/src/components/chat/chat-playground.tsx](file:///d:/timeModel/advanced-rag/web-tanstack/src/components/chat/chat-playground.tsx)
+**文件**：[web-tanstack/src/components/chat/chat-playground.tsx](file:///d:/timeModel/Mnemo/web-tanstack/src/components/chat/chat-playground.tsx)
 
 **修改**：
 ```tsx
@@ -315,7 +315,7 @@ useEffect(() => {
 
 **问题**：`sendChatStream` 中 reader 在异常路径未显式释放。
 
-**文件**：[web-tanstack/src/lib/api.ts](file:///d:/timeModel/advanced-rag/web-tanstack/src/lib/api.ts)
+**文件**：[web-tanstack/src/lib/api.ts](file:///d:/timeModel/Mnemo/web-tanstack/src/lib/api.ts)
 
 **修改**：
 ```tsx

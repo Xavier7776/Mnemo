@@ -11,7 +11,9 @@ class EmbeddingService:
         self,
         model_name: Optional[str] = None
     ):
-        self.model_name = model_name or os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-base-zh-v1.5")
+        # Phase 2 优化：嵌入模型从 bge-base-zh-v1.5（768维）升级到 bge-large-zh-v1.5（1024维）
+        # bge-large-zh-v1.5 是中文 SOTA 嵌入模型，在 C-MTEB 中文检索任务上表现更好
+        self.model_name = model_name or os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-large-zh-v1.5")
         self._model = None
         self.vector_size = None
         logger.info(f"Embedding 服务初始化 - 模型: {self.model_name}")
@@ -53,8 +55,17 @@ class EmbeddingService:
                 cleaned.append(t)
         
         text_list = cleaned
-        # BGE 官方要求：提问时加前缀，文档入库不加
-        if is_query and "bge" in self.model_name.lower():
+        # BGE-zh 系列官方要求：query 加前缀，document 不加
+        # 但 bge-m3 不需要前缀（原生支持 query/passage，自动处理）
+        # bge-large-zh-v1.5 / bge-base-zh-v1.5 需要 "为这个句子生成表示以用于检索：" 前缀
+        model_lower = self.model_name.lower()
+        needs_query_prefix = (
+            is_query
+            and "bge" in model_lower
+            and "zh-v1.5" in model_lower  # 仅 bge-base-zh-v1.5 / bge-large-zh-v1.5
+            and "m3" not in model_lower   # 排除 bge-m3
+        )
+        if needs_query_prefix:
             text_list = ["为这个句子生成表示以用于检索：" + t for t in cleaned]
         
         try:

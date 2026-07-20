@@ -1,11 +1,11 @@
-# advanced-rag
+# Mnemo
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/release-1.0.0-228b22.svg)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104%2B-009688.svg)](https://fastapi.tiangolo.com/)
 
-`advanced-rag` 是一个面向本地知识库问答与复杂问题分析的 RAG 项目。后端基于 FastAPI，提供文档入库、混合检索、流式聊天、深度研究和运行时配置接口；前端目前保留两套实现：`web/` 是 Next.js 版本，`web-tanstack/` 是基于 Vite + TanStack 系列的新版本。
+`Mnemo` 是一个面向本地知识库问答与复杂问题分析的 RAG 项目。后端基于 FastAPI，提供文档入库、混合检索、流式聊天、深度研究和运行时配置接口；前端目前保留两套实现：`web/` 是 Next.js 版本，`web-tanstack/` 是基于 Vite + TanStack 系列的新版本。
 
 当前发布版本为 `1.0.0`。后端版本号的单一来源是 [utils/version.py](utils/version.py)，健康检查和 OpenAPI 版本都会读取它。
 
@@ -42,7 +42,7 @@
 ## 目录结构
 
 ```txt
-advanced-rag/
+mnemo/
 ├── agents/              # 通用对话、深度研究与专家 Agent
 ├── chunking/            # 文本分块与分块路由
 ├── database/            # MongoDB、Qdrant 等连接与仓储
@@ -126,8 +126,8 @@ SECRET_KEY=dev-secret-key-change-me
 API_HOST=0.0.0.0
 API_PORT=8000
 
-MONGODB_URI=mongodb://admin:admin123@localhost:27017/advanced_rag?authSource=admin
-MONGODB_DB_NAME=advanced_rag
+MONGODB_URI=mongodb://admin:admin123@localhost:27017/mnemo?authSource=admin
+MONGODB_DB_NAME=mnemo
 
 QDRANT_URL=http://localhost:6333
 QDRANT_API_KEY=
@@ -148,7 +148,7 @@ MAX_UPLOAD_SIZE=104857600
 UPLOAD_DIR=./uploads
 
 LOG_LEVEL=INFO
-LOG_FILE=./logs/advanced-rag-api.log
+LOG_FILE=./logs/mnemo-api.log
 ```
 
 如果后端运行在容器里，而 MongoDB、Qdrant、Neo4j、Redis 或 Ollama 运行在宿主机，参考 [.env.docker.local](.env.docker.local)，把地址改成 `host.docker.internal`。
@@ -220,17 +220,17 @@ VITE_API_URL=http://localhost:8000
 
 ```bash
 ./download_dependencies.sh
-DOCKER_BUILDKIT=1 docker build -t advanced-rag .
+DOCKER_BUILDKIT=1 docker build -t mnemo .
 ```
 
 运行 API 容器：
 
 ```bash
 docker run -d \
-  --name advanced-rag-api \
+  --name mnemo-api \
   -p 8000:8000 \
   --env-file .env.docker.local \
-  advanced-rag
+  mnemo
 ```
 
 `docker-compose.yml` 当前用于本地依赖服务。如果需要把 API 也纳入 compose，需要额外添加应用服务并处理模型、上传目录、日志目录和依赖健康检查。
@@ -284,7 +284,7 @@ docker run -d \
 
 ```env
 LOG_LEVEL=INFO
-LOG_FILE=./logs/advanced-rag-api.log
+LOG_FILE=./logs/mnemo-api.log
 ```
 
 HTTP 请求日志可以通过运行时配置动态调整：

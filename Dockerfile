@@ -1,8 +1,8 @@
-# advanced-rag - 开源高级RAG系统 Dockerfile
+# Mnemo - 开源高级RAG系统 Dockerfile
 # 基于稳定版本优化，保留缓存策略，使用国内镜像源加速
 #
-# 构建: DOCKER_BUILDKIT=1 docker build -t advanced-rag .
-# 运行: docker run -p 8000:8000 --env-file .env.production advanced-rag
+# 构建: DOCKER_BUILDKIT=1 docker build -t mnemo .
+# 运行: docker run -p 8000:8000 --env-file .env.production mnemo
 #
 # 镜像源说明：
 # - APT: 使用清华镜像 (mirrors.tuna.tsinghua.edu.cn)

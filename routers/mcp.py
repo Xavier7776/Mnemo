@@ -84,10 +84,14 @@ async def list_servers():
 @router.get("/status", response_model=MCPStatusResponse)
 async def get_mcp_status():
     """获取 MCP 整体状态"""
+    import os
     from services.mcp_client_service import mcp_client_manager
 
     servers = mcp_client_manager.get_server_status()
     connected = sum(1 for s in servers if s["connected"])
+
+    # 状态查询时按当前 LLM 模型自适应阈值，与 llm_service 实际判断保持一致
+    current_model = os.getenv("LLM_MODEL")
 
     return MCPStatusResponse(
         initialized=mcp_client_manager.is_initialized,
@@ -95,7 +99,7 @@ async def get_mcp_status():
         total_servers=len(servers),
         connected_servers=connected,
         total_tools=mcp_client_manager.total_tool_count,
-        compact_mode=mcp_client_manager.should_use_compact_mode(),
+        compact_mode=mcp_client_manager.should_use_compact_mode(current_model),
         servers=[ServerStatusResponse(**s) for s in servers],
     )
 

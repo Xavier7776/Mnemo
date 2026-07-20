@@ -42,8 +42,8 @@ def parse_mongodb_uri(mongodb_uri: str) -> Tuple[str, str]:
     
     Args:
         mongodb_uri: MongoDB连接字符串，例如：
-            - mongodb://localhost:27017/advanced_rag
-            - mongodb://user:pass@localhost:27017/advanced_rag?authSource=admin
+            - mongodb://localhost:27017/mnemo
+            - mongodb://user:pass@localhost:27017/mnemo?authSource=admin
             - mongodb://localhost:27017/
     
     Returns:
@@ -60,8 +60,8 @@ def parse_mongodb_uri(mongodb_uri: str) -> Tuple[str, str]:
     
     # 如果没有数据库名称，使用默认值
     if not db_name:
-        db_name = os.getenv("MONGODB_DB_NAME", "advanced_rag")
-    
+        db_name = os.getenv("MONGODB_DB_NAME", "mnemo")
+
     # 构建不包含数据库名称的连接字符串
     # 保留认证信息、查询参数等
     if parsed.username and parsed.password:
@@ -117,8 +117,8 @@ class MongoDB:
                 # 无认证连接字符串
                 connection_string = f"mongodb://{host}:{port}/"
             
-            db_name = os.getenv("MONGODB_DB_NAME", "advanced_rag")
-        
+            db_name = os.getenv("MONGODB_DB_NAME", "mnemo")
+
         # 配置连接池参数，优化高并发性能
         # maxPoolSize: 每个worker的最大连接数（建议100-200）
         # minPoolSize: 最小连接池大小（保持一定数量的连接）
@@ -264,7 +264,7 @@ class MongoDBClient:
                 else:
                     self.connection_string = f"mongodb://{host}:{port}/"
                 
-                self.db_name = os.getenv("MONGODB_DB_NAME", "advanced_rag")
+                self.db_name = os.getenv("MONGODB_DB_NAME", "mnemo")
                 logger.info(f"✓ 使用单独的环境变量构建连接字符串")
         
         logger.debug(f"数据库名称: {self.db_name}")

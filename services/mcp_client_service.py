@@ -1,9 +1,12 @@
 """MCP Client 服务 — 连接外部 MCP Server，扩展 Agent 可用工具
 
-阶段二增强：
-- 断线重连：call_tool 失败时自动重连一次再重试
+阶段二增强（v2 修复版）：
+- 主动健康检查：后台心跳任务定期 ping Server，断连主动发现
+- 断线重连：指数退避重试（1s/2s/4s，最多 3 次）
+- 熔断保护：连续失败 N 次触发熔断，cooldown 后半开试探
+- 幂等保护：非安全工具不自动重试，避免重复执行副作用
+- 调用追踪：每次 call_tool 生成 call_id，记录状态供查询
 - 热加载：运行时动态增删改 Server 配置，无需重启
-- 健康检查：定期检测 Server 连接状态
 - 工具按需加载：工具数量超过阈值时，只注入摘要，LLM 通过 mcp_list_tools 发现
 - 配置持久化：增删改 Server 时自动写回 mcp_servers.json
 
@@ -17,10 +20,123 @@ import json
 import asyncio
 from typing import Dict, List, Any, Optional, Tuple, Set
 from utils.logger import logger
+from services.mcp_circuit_breaker import CircuitBreaker
+from services.mcp_call_log import mcp_call_log, CallRecord
 
 
 # 工具按需加载的阈值：超过此数量时启用摘要模式
+# v3: 作为兜底默认值，实际阈值由 get_adaptive_tool_threshold(model_name) 动态计算
 TOOL_COUNT_THRESHOLD = 20
+
+# 健康检查配置
+HEALTH_CHECK_INTERVAL = 30.0  # 每 30 秒 ping 一次
+HEALTH_CHECK_TIMEOUT = 5.0    # ping 超时 5 秒视为断连
+
+# 重连配置
+RECONNECT_MAX_ATTEMPTS = 3    # 指数退避最多重试 3 次
+RECONNECT_INITIAL_DELAY = 1.0 # 首次重试延迟 1 秒
+RECONNECT_BACKOFF_FACTOR = 2.0  # 每次延迟翻倍
+
+# 熔断配置
+CIRCUIT_FAILURE_THRESHOLD = 5  # 连续失败 5 次触发熔断
+CIRCUIT_COOLDOWN_SECONDS = 60.0  # 熔断 60 秒后进入半开
+
+# 默认幂等性：以下前缀的工具视为可安全重试
+SAFE_RETRY_PREFIXES = ("list_", "get_", "search_", "query_", "read_", "fetch_")
+
+
+# ==================== v3 新增：模型 context window 自适应阈值 ====================
+
+# 常见 LLM 模型的 context window（按 tokens 计，model_name 小写前缀匹配）
+# 未列出的模型按 DEFAULT_CONTEXT_WINDOW 兜底
+MODEL_CONTEXT_WINDOW: Dict[str, int] = {
+    # OpenAI
+    "gpt-4o": 128_000,
+    "gpt-4-turbo": 128_000,
+    "gpt-4": 8_192,
+    "gpt-3.5-turbo": 16_384,
+    # Anthropic
+    "claude-3-opus": 200_000,
+    "claude-3-sonnet": 200_000,
+    "claude-3-haiku": 200_000,
+    "claude-3.5-sonnet": 200_000,
+    # 国内模型
+    "mimo-v2.5": 32_768,
+    "deepseek-chat": 32_768,
+    "deepseek-coder": 16_384,
+    "qwen2.5": 32_768,
+    "qwen2": 32_768,
+    "glm-4": 128_000,
+    # 开源模型
+    "llama3.1": 128_000,
+    "llama3": 8_192,
+}
+
+DEFAULT_CONTEXT_WINDOW = 16_384  # 未识别模型的默认 context window
+
+
+def get_model_context_window(model_name: str) -> int:
+    """根据模型名查询 context window 大小（精确 → 前缀模糊匹配 → 默认值）
+
+    Args:
+        model_name: LLM 模型名（如 "mimo-v2.5"、"gpt-4o-2024-08-06"）
+
+    Returns:
+        context window 大小（tokens）
+    """
+    if not model_name:
+        return DEFAULT_CONTEXT_WINDOW
+
+    model_lower = model_name.lower()
+
+    # 精确匹配
+    if model_lower in MODEL_CONTEXT_WINDOW:
+        return MODEL_CONTEXT_WINDOW[model_lower]
+
+    # 前缀匹配（model_name 可能带版本号或日期后缀）
+    for prefix, ctx in MODEL_CONTEXT_WINDOW.items():
+        if model_lower.startswith(prefix):
+            return ctx
+
+    return DEFAULT_CONTEXT_WINDOW
+
+
+def get_adaptive_tool_threshold(model_name: str) -> int:
+    """根据 LLM 模型的 context window 自适应计算工具数量阈值
+
+    阈值映射逻辑（基于实验5的拐点验证 + token 占用推算）：
+    - ≤ 8K  context: prompt 预算紧张，阈值 15（早启用 compact 省 token）
+    - ≤ 16K context: 阈值 18
+    - ≤ 32K context: 阈值 22
+    - ≤ 64K context: 阈值 28
+    - ≤ 128K context: 阈值 35
+    - > 128K context: 阈值 40（大窗口晚启用，减少 mcp_list_tools 调用）
+
+    推算依据：单个 MCP 工具 schema 平均 200~300 tokens，compact summary 每工具 30~50 tokens。
+    context window 越大，能容纳的 schema 越多，越晚启用 compact mode 越划算（避免 LLM 多一次
+    list_tools 调用带来的延迟和误判）。context window 越小，越早启用 compact mode 节省 token，
+    防止工具 schema 挤占 RAG context 空间。
+
+    Args:
+        model_name: LLM 模型名
+
+    Returns:
+        该模型对应的工具数量阈值
+    """
+    ctx = get_model_context_window(model_name)
+
+    if ctx <= 8_192:
+        return 15
+    elif ctx <= 16_384:
+        return 18
+    elif ctx <= 32_768:
+        return 22
+    elif ctx <= 65_536:
+        return 28
+    elif ctx <= 131_072:
+        return 35
+    else:
+        return 40
 
 
 class MCPClientManager:
@@ -47,6 +163,12 @@ class MCPClientManager:
         self._reconnect_locks: Dict[str, asyncio.Lock] = {}
         # 已注册到 ai_tools 的工具名集合（用于热更新时清理旧工具）
         self._registered_tool_names: Set[str] = set()
+        # v2 新增：熔断器（server_name → CircuitBreaker）
+        self._circuit_breakers: Dict[str, CircuitBreaker] = {}
+        # v2 新增：健康检查任务
+        self._health_check_task: Optional[asyncio.Task] = None
+        # v2 新增：是否正在关闭（避免关闭时健康检查任务报错）
+        self._shutting_down = False
 
     @property
     def is_initialized(self) -> bool:
@@ -106,12 +228,29 @@ class MCPClientManager:
                 self._disconnected.add(server_name)
                 self._server_configs[server_name] = server_config
 
+            # 为每个 server 创建熔断器
+            if server_name not in self._circuit_breakers:
+                self._circuit_breakers[server_name] = CircuitBreaker(
+                    name=server_name,
+                    failure_threshold=int(server_config.get("circuit_failure_threshold", CIRCUIT_FAILURE_THRESHOLD)),
+                    cooldown_seconds=float(server_config.get("circuit_cooldown_seconds", CIRCUIT_COOLDOWN_SECONDS)),
+                )
+
         self._initialized = True
         total_tools = self.total_tool_count
         logger.info(
             f"MCP 初始化完成: {success_count}/{len(servers)} 个 Server 连接成功，"
             f"共发现 {total_tools} 个工具"
         )
+
+        # v3 新增：构建工具语义索引（用于 compact mode 按需加载）
+        try:
+            self.build_tool_index()
+        except Exception as e:
+            logger.warning(f"ToolIndex 构建失败（非关键路径，降级到全量模式）: {e}", exc_info=True)
+
+        # v2 新增：启动后台健康检查任务
+        self._start_health_check_task()
 
     async def _connect_server(self, server_name: str, server_config: dict) -> None:
         """连接单个 MCP Server
@@ -262,7 +401,10 @@ class MCPClientManager:
         )
 
     async def _reconnect_server(self, server_name: str) -> bool:
-        """重连单个 Server（含清理旧连接）
+        """重连单个 Server（含清理旧连接 + 指数退避重试）
+
+        v2 修复：原版只重连一次，失败立即返回 false。新版用指数退避最多重试 3 次。
+        退避序列：1s → 2s → 4s
 
         Args:
             server_name: Server 名称
@@ -279,25 +421,150 @@ class MCPClientManager:
             if server_name in self._sessions and server_name not in self._disconnected:
                 return True
 
-            logger.info(f"MCP Server [{server_name}] 正在重连...")
-
-            # 清理旧连接
-            await self._cleanup_server(server_name)
-
-            # 重新连接
             server_config = self._server_configs.get(server_name)
             if not server_config:
                 logger.error(f"MCP Server [{server_name}] 无配置信息，无法重连")
                 return False
 
-            try:
-                await self._connect_server(server_name, server_config)
-                logger.info(f"MCP Server [{server_name}] 重连成功")
-                return True
-            except Exception as e:
-                logger.error(f"MCP Server [{server_name}] 重连失败: {e}", exc_info=True)
-                self._disconnected.add(server_name)
-                return False
+            # 指数退避重试
+            delay = RECONNECT_INITIAL_DELAY
+            for attempt in range(1, RECONNECT_MAX_ATTEMPTS + 1):
+                logger.info(f"MCP Server [{server_name}] 重连尝试 {attempt}/{RECONNECT_MAX_ATTEMPTS}...")
+
+                # 清理旧连接（只在首次和重试前清理）
+                if attempt == 1:
+                    await self._cleanup_server(server_name)
+
+                try:
+                    await self._connect_server(server_name, server_config)
+                    logger.info(f"MCP Server [{server_name}] 重连成功（第 {attempt} 次尝试）")
+                    # 重置熔断器（重连成功视为恢复）
+                    cb = self._circuit_breakers.get(server_name)
+                    if cb:
+                        cb.reset()
+                    # v3: 重连后工具列表可能变化，重建 ToolIndex
+                    try:
+                        self.build_tool_index()
+                    except Exception as e:
+                        logger.warning(f"重连后重建 ToolIndex 失败（非关键路径）: {e}")
+                    return True
+                except Exception as e:
+                    logger.warning(f"MCP Server [{server_name}] 第 {attempt} 次重连失败: {e}")
+                    self._disconnected.add(server_name)
+                    # 最后一次不用 sleep
+                    if attempt < RECONNECT_MAX_ATTEMPTS:
+                        logger.info(f"MCP Server [{server_name}] 等待 {delay:.1f}s 后重试...")
+                        await asyncio.sleep(delay)
+                        delay *= RECONNECT_BACKOFF_FACTOR
+
+            logger.error(f"MCP Server [{server_name}] 重连失败（已尝试 {RECONNECT_MAX_ATTEMPTS} 次）")
+            return False
+
+    # ==================== v2 新增：主动健康检查 ====================
+
+    def _start_health_check_task(self) -> None:
+        """启动后台健康检查任务（每 30s ping 一次所有 server）"""
+        if self._health_check_task and not self._health_check_task.done():
+            return  # 已在运行
+
+        async def _health_check_loop():
+            logger.info(f"MCP 健康检查任务已启动（间隔 {HEALTH_CHECK_INTERVAL}s）")
+            while not self._shutting_down:
+                try:
+                    await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+                    if self._shutting_down:
+                        break
+                    await self._run_health_check()
+                except asyncio.CancelledError:
+                    logger.info("MCP 健康检查任务被取消")
+                    break
+                except Exception as e:
+                    logger.warning(f"MCP 健康检查异常: {e}")
+            logger.info("MCP 健康检查任务已停止")
+
+        self._health_check_task = asyncio.create_task(_health_check_loop())
+
+    async def _run_health_check(self) -> None:
+        """对所有 server 做一次 ping 健康检查"""
+        # 复制一份 server 列表，避免迭代时被修改
+        server_names = list(self._server_configs.keys())
+        for server_name in server_names:
+            if self._shutting_down:
+                break
+            await self._ping_server(server_name)
+
+    async def _ping_server(self, server_name: str) -> None:
+        """对单个 server 做一次 ping 检查
+
+        策略：
+        - 用 session.send_request 发送 ping 请求（MCP 协议内置的 ping method）
+        - 超时 5s 视为断连
+        - 失败时标记 _disconnected，但不立即触发重连（重连由 call_tool 入口触发）
+        """
+        if server_name not in self._sessions:
+            return  # 本来就没连上，不重复处理
+
+        session = self._sessions[server_name]
+        try:
+            # MCP 协议内置的 ping 方法
+            await asyncio.wait_for(
+                session.send_request("ping", {}),
+                timeout=HEALTH_CHECK_TIMEOUT,
+            )
+            # ping 成功，清除断连标记
+            if server_name in self._disconnected:
+                logger.info(f"MCP 健康检查 [{server_name}] ping 成功，清除断连标记")
+                self._disconnected.discard(server_name)
+        except asyncio.TimeoutError:
+            logger.warning(f"MCP 健康检查 [{server_name}] ping 超时（{HEALTH_CHECK_TIMEOUT}s），标记为断连")
+            self._disconnected.add(server_name)
+        except Exception as e:
+            logger.warning(f"MCP 健康检查 [{server_name}] ping 失败: {e}，标记为断连")
+            self._disconnected.add(server_name)
+
+    def _stop_health_check_task(self) -> None:
+        """停止健康检查任务"""
+        if self._health_check_task and not self._health_check_task.done():
+            self._health_check_task.cancel()
+
+    # ==================== v2 新增：幂等性判断 ====================
+
+    def _is_safe_retry(self, server_name: str, tool_name: str) -> bool:
+        """判断工具是否可安全重试（幂等）
+
+        策略：
+        1. 优先看 server config 里的 safe_retry_tools 白名单
+        2. 其次看 server config 里的 unsafe_retry_tools 黑名单
+        3. 默认：以 list_/get_/search_/query_/read_/fetch_ 开头的工具视为安全
+        4. 其他工具（如 send_email, create_resource）视为不安全
+        """
+        config = self._server_configs.get(server_name, {})
+
+        # 显式白名单
+        safe_whitelist = config.get("safe_retry_tools", [])
+        if tool_name in safe_whitelist:
+            return True
+
+        # 显式黑名单
+        unsafe_blacklist = config.get("unsafe_retry_tools", [])
+        if tool_name in unsafe_blacklist:
+            return False
+
+        # 默认前缀匹配
+        return tool_name.lower().startswith(SAFE_RETRY_PREFIXES)
+
+    # ==================== v2 新增：熔断器访问 ====================
+
+    def _get_circuit_breaker(self, server_name: str) -> CircuitBreaker:
+        """获取或创建熔断器"""
+        if server_name not in self._circuit_breakers:
+            config = self._server_configs.get(server_name, {})
+            self._circuit_breakers[server_name] = CircuitBreaker(
+                name=server_name,
+                failure_threshold=int(config.get("circuit_failure_threshold", CIRCUIT_FAILURE_THRESHOLD)),
+                cooldown_seconds=float(config.get("circuit_cooldown_seconds", CIRCUIT_COOLDOWN_SECONDS)),
+            )
+        return self._circuit_breakers[server_name]
 
     async def _cleanup_server(self, server_name: str) -> None:
         """清理单个 Server 的所有资源（session、transport、工具）
@@ -363,7 +630,12 @@ class MCPClientManager:
     async def call_tool(self, server_name: str, tool_name: str, arguments: dict) -> dict:
         """路由调用到对应 Server 的 session.call_tool
 
-        含断线重连逻辑：首次调用失败时自动重连一次再重试。
+        v2 修复版，含 5 重防护：
+        1. 熔断检查：熔断中（OPEN）直接拒绝，不发起调用
+        2. 断连检查：断连时先重连（指数退避最多 3 次）
+        3. 幂等保护：非安全工具不自动重试，避免副作用重复执行
+        4. 调用追踪：生成 call_id，记录状态供查询
+        5. 熔断反馈：成功/失败都通知熔断器
 
         Args:
             server_name: Server 名称
@@ -371,27 +643,51 @@ class MCPClientManager:
             arguments: 工具参数
 
         Returns:
-            调用结果字典
+            调用结果字典（含 call_id 供追踪）
         """
-        # 检查是否断连，尝试重连
+        # v2 新增：创建 call 记录
+        record = mcp_call_log.new_call(server_name, tool_name, arguments)
+
+        # 1. 熔断检查
+        cb = self._get_circuit_breaker(server_name)
+        if not cb.allow_request():
+            logger.warning(f"MCP 熔断中 [{server_name}]，拒绝调用 {tool_name}")
+            cb.record_failure()  # 熔断状态下的拒绝也算失败
+            mcp_call_log.mark_failed(record, f"熔断中（state={cb.state}）")
+            return {
+                "success": False,
+                "error": f"MCP Server [{server_name}] 熔断中，请稍后重试",
+                "call_id": record.call_id,
+                "circuit_state": cb.state,
+            }
+
+        # 2. 断连检查 + 重连
         if server_name in self._disconnected or server_name not in self._sessions:
             reconnected = await self._reconnect_server(server_name)
             if not reconnected:
+                cb.record_failure()
+                mcp_call_log.mark_failed(record, "未连接且重连失败")
                 return {
                     "success": False,
                     "error": f"MCP Server [{server_name}] 未连接且重连失败",
+                    "call_id": record.call_id,
+                    "circuit_state": cb.state,
                 }
 
         session = self._sessions.get(server_name)
         if session is None:
+            cb.record_failure()
+            mcp_call_log.mark_failed(record, "session 不存在")
             return {
                 "success": False,
                 "error": f"MCP Server [{server_name}] 未连接",
+                "call_id": record.call_id,
             }
 
         server_config = self._server_configs.get(server_name, {})
         timeout = server_config.get("timeout", 30)
 
+        # 3. 首次调用
         try:
             result = await asyncio.wait_for(
                 session.call_tool(tool_name, arguments),
@@ -401,35 +697,68 @@ class MCPClientManager:
             if result.isError:
                 error_text = self._extract_text(result.content)
                 logger.warning(f"MCP 工具调用返回错误 [{server_name}/{tool_name}]: {error_text}")
+                # 工具执行返回错误（如参数错误），不算连接问题，不触发重连
+                cb.record_success()  # 通信成功，工具业务错误不算熔断信号
+                mcp_call_log.mark_failed(record, error_text or "MCP 工具返回错误")
                 return {
                     "success": False,
                     "error": error_text or "MCP 工具返回错误",
+                    "call_id": record.call_id,
                 }
 
             text_content = self._extract_text(result.content)
+            cb.record_success()
+            mcp_call_log.mark_success(record, text_content)
             return {
                 "success": True,
                 "result": text_content,
+                "call_id": record.call_id,
             }
 
         except asyncio.TimeoutError:
+            # 超时不视为断连，不触发重连
             logger.error(f"MCP 工具调用超时 [{server_name}/{tool_name}] ({timeout}s)")
+            cb.record_failure()
+            mcp_call_log.mark_failed(record, f"工具调用超时（{timeout}s）")
             return {
                 "success": False,
                 "error": f"工具调用超时（{timeout}s）",
+                "call_id": record.call_id,
+                "circuit_state": cb.state,
             }
         except Exception as e:
             logger.warning(f"MCP 工具调用异常 [{server_name}/{tool_name}]: {e}")
 
-            # 尝试重连一次后重试
-            logger.info(f"MCP Server [{server_name}] 尝试重连后重试...")
+            # 4. 幂等保护：非安全工具不自动重试
+            if not self._is_safe_retry(server_name, tool_name):
+                logger.warning(
+                    f"MCP 工具 [{server_name}/{tool_name}] 非幂等，不自动重试（避免副作用重复执行）"
+                )
+                cb.record_failure()
+                self._disconnected.add(server_name)
+                mcp_call_log.mark_dropped(record, f"非幂等工具不重试，原异常: {str(e)}")
+                return {
+                    "success": False,
+                    "error": f"MCP 工具调用失败（非幂等，未重试）: {str(e)}",
+                    "call_id": record.call_id,
+                    "retried": False,
+                    "circuit_state": cb.state,
+                }
+
+            # 5. 幂等工具：重连 + 重试一次
+            mcp_call_log.mark_retrying(record)
+            logger.info(f"MCP Server [{server_name}] 尝试重连后重试（幂等工具）...")
             self._disconnected.add(server_name)
             reconnected = await self._reconnect_server(server_name)
 
             if not reconnected:
+                cb.record_failure()
+                mcp_call_log.mark_failed(record, f"重连失败: {str(e)}")
                 return {
                     "success": False,
                     "error": f"MCP Server [{server_name}] 连接断开且重连失败: {str(e)}",
+                    "call_id": record.call_id,
+                    "circuit_state": cb.state,
                 }
 
             # 重试一次
@@ -442,22 +771,36 @@ class MCPClientManager:
 
                 if result.isError:
                     error_text = self._extract_text(result.content)
+                    cb.record_failure()
+                    mcp_call_log.mark_failed(record, f"重试后工具返回错误: {error_text}")
                     return {
                         "success": False,
                         "error": error_text or "MCP 工具返回错误",
+                        "call_id": record.call_id,
+                        "retried": True,
+                        "circuit_state": cb.state,
                     }
 
                 text_content = self._extract_text(result.content)
+                cb.record_success()
+                mcp_call_log.mark_success(record, text_content)
                 logger.info(f"MCP 工具重试成功 [{server_name}/{tool_name}]")
                 return {
                     "success": True,
                     "result": text_content,
+                    "call_id": record.call_id,
+                    "retried": True,
                 }
             except Exception as e2:
                 logger.error(f"MCP 工具重试仍失败 [{server_name}/{tool_name}]: {e2}")
+                cb.record_failure()
+                mcp_call_log.mark_failed(record, f"重试失败: {str(e2)}")
                 return {
                     "success": False,
                     "error": f"工具调用重试失败: {str(e2)}",
+                    "call_id": record.call_id,
+                    "retried": True,
+                    "circuit_state": cb.state,
                 }
 
     def _extract_text(self, content_list: list) -> str:
@@ -503,6 +846,12 @@ class MCPClientManager:
         # 持久化配置
         self._save_config()
 
+        # v3: 工具列表变化，重建 ToolIndex
+        try:
+            self.build_tool_index()
+        except Exception as e:
+            logger.warning(f"add_server 后重建 ToolIndex 失败（非关键路径）: {e}")
+
         tool_count = len(self._tools.get(server_name, []))
         return {
             "success": True,
@@ -536,6 +885,12 @@ class MCPClientManager:
         self._config.get("servers", {}).pop(server_name, None)
         self._save_config()
 
+        # v3: 工具列表变化，重建 ToolIndex
+        try:
+            self.build_tool_index()
+        except Exception as e:
+            logger.warning(f"remove_server 后重建 ToolIndex 失败（非关键路径）: {e}")
+
         return {"success": True, "message": f"Server [{server_name}] 已移除"}
 
     async def update_server(self, server_name: str, server_config: dict) -> dict:
@@ -567,6 +922,13 @@ class MCPClientManager:
             return {"success": False, "message": f"重连失败: {str(e)}", "tool_count": 0}
 
         self._save_config()
+
+        # v3: 工具列表变化，重建 ToolIndex
+        try:
+            self.build_tool_index()
+        except Exception as e:
+            logger.warning(f"update_server 后重建 ToolIndex 失败（非关键路径）: {e}")
+
         tool_count = len(self._tools.get(server_name, []))
         return {
             "success": True,
@@ -600,10 +962,11 @@ class MCPClientManager:
         """获取所有 Server 的状态
 
         Returns:
-            Server 状态列表
+            Server 状态列表（含熔断器状态和最近调用记录）
         """
         result = []
         for name, config in self._server_configs.items():
+            cb = self._circuit_breakers.get(name)
             result.append({
                 "name": name,
                 "transport": config.get("transport", "stdio"),
@@ -612,6 +975,10 @@ class MCPClientManager:
                 "tool_count": len(self._tools.get(name, [])),
                 "tools": [t.name for t in self._tools.get(name, [])],
                 "timeout": config.get("timeout", 30),
+                # v2 新增字段
+                "circuit_state": cb.state if cb else "unknown",
+                "circuit_failure_count": cb._failure_count if cb else 0,
+                "recent_calls": len(mcp_call_log.get_records(name, limit=10)),
             })
         return result
 
@@ -636,19 +1003,42 @@ class MCPClientManager:
 
     # —— 工具按需加载 —— 
 
-    def should_use_compact_mode(self) -> bool:
-        """是否应该使用紧凑模式（工具数量超过阈值时）
+    def should_use_compact_mode(self, model_name: Optional[str] = None) -> bool:
+        """是否应该使用紧凑模式（工具数量超过阈值时启用）
 
         紧凑模式下，只注入工具摘要到 system prompt，
         LLM 通过 mcp_list_tools 发现具体工具后再调用。
 
+        v3 增强：根据 LLM 模型的 context window 自适应调整阈值。
+        - 传入 model_name 时：用 get_adaptive_tool_threshold(model_name) 动态计算阈值
+          （8K→15, 16K→18, 32K→22, 64K→28, 128K→35, >128K→40）
+        - 不传 model_name 时：用默认常量 TOOL_COUNT_THRESHOLD（=20，向后兼容）
+
+        Args:
+            model_name: LLM 模型名（如 "mimo-v2.5"、"gpt-4o"），None 时用默认阈值
+
         Returns:
             是否启用紧凑模式
         """
-        return self.total_tool_count > TOOL_COUNT_THRESHOLD
+        if model_name:
+            threshold = get_adaptive_tool_threshold(model_name)
+        else:
+            threshold = TOOL_COUNT_THRESHOLD
+        return self.total_tool_count > threshold
 
     def get_compact_tool_summary(self) -> str:
         """获取紧凑模式的工具摘要（用于注入 system prompt）
+
+        v2 增强：每个工具加入 description 摘要，让 LLM 不用调 mcp_list_tools 就能判断是否需要该工具。
+        v3 调整：compact mode 已改为按需加载（ToolIndex 检索相关工具直接注入 schema），
+                此方法保留用于 system prompt 中告知 LLM 可用工具的全貌。
+
+        格式示例：
+            [filesystem] 11 个工具:
+              - mcp__filesystem__read_file: 读取文件内容（支持文本/二进制）
+              - mcp__filesystem__write_file: 写入文件内容
+              - mcp__filesystem__list_directory: 列出目录下的文件
+              ...
 
         Returns:
             工具摘要文本
@@ -656,11 +1046,122 @@ class MCPClientManager:
         if not self.should_use_compact_mode():
             return ""
 
-        lines = ["MCP 工具摘要（使用 mcp_list_tools 查看详情）:"]
+        lines = ["MCP 工具摘要（含简短说明，使用 mcp_list_tools 查看完整 schema）:"]
         for server_name, tools in self._tools.items():
-            tool_names = [t.name for t in tools]
-            lines.append(f"  [{server_name}] {len(tools)} 个工具: {', '.join(tool_names)}")
+            lines.append(f"\n[{server_name}] {len(tools)} 个工具:")
+            for tool in tools:
+                # 提取 description 的第一行/第一句，截断到 60 字符
+                desc_raw = (tool.description or "").strip()
+                # 取第一行（很多 MCP 工具 description 是多行）
+                desc_first_line = desc_raw.split("\n")[0].strip() if desc_raw else ""
+                # 取第一句（按。或. 分割）
+                if "。" in desc_first_line:
+                    desc_first_line = desc_first_line.split("。")[0].strip()
+                elif ". " in desc_first_line:
+                    desc_first_line = desc_first_line.split(". ")[0].strip()
+                # 截断到 60 字符
+                if len(desc_first_line) > 60:
+                    desc_first_line = desc_first_line[:57] + "..."
+                # 去掉工具名里的 server 前缀（如 mcp__filesystem__read_file → read_file）
+                short_name = tool.name
+                if short_name.startswith(f"mcp__{server_name}__"):
+                    short_name = short_name[len(f"mcp__{server_name}__"):]
+
+                if desc_first_line:
+                    lines.append(f"  - {short_name}: {desc_first_line}")
+                else:
+                    lines.append(f"  - {short_name}")
         return "\n".join(lines)
+
+    # ==================== v3 新增：ToolIndex 按需加载 ====================
+
+    def build_tool_index(self) -> None:
+        """构建工具语义索引（基于 embedding）
+
+        在 MCP 初始化完成、工具列表稳定后调用。构建后可以用 get_relevant_tool_schemas(query)
+        按 query 检索相关工具的完整 schema，避免把所有工具 schema 都塞进 LLM prompt。
+
+        幂等：重复调用会清空旧索引重建。建议在以下时机调用：
+        - initialize() 完成后
+        - 热加载增删 Server 后
+        - 重连成功后（工具列表可能变化）
+        """
+        from services.mcp_tool_index import mcp_tool_index
+
+        if not self._tools:
+            logger.info("ToolIndex 构建：无工具可索引（MCP 未连接或未启用）")
+            mcp_tool_index.clear()
+            return
+
+        mcp_tool_index.build(self._tools)
+        logger.info(
+            f"ToolIndex 构建完成: {mcp_tool_index.size} 个工具，"
+            f"mode={'embedding' if not mcp_tool_index._use_keyword_fallback else 'keyword'}"
+        )
+
+    def get_relevant_tool_schemas(
+        self,
+        query: str,
+        top_k: int = 5,
+        min_score: float = 0.0,
+    ) -> List[Dict[str, Any]]:
+        """按 query 检索最相关的 N 个工具，返回完整 schema
+
+        v3 按需加载核心方法。compact mode 下替代 get_all_tools() 全量注入。
+
+        Args:
+            query: 用户查询（通常是 user prompt）
+            top_k: 返回的工具数量（建议 3~10）
+            min_score: 最低相似度阈值（embedding 模式下 0~1，关键词模式下不太准确）
+                默认 0.0 表示不过滤
+
+        Returns:
+            工具 schema 列表（OpenAI Function Calling 格式），按相关性降序
+            格式：[{"name": "mcp__server__tool", "description": "...", "parameters": {...}}, ...]
+        """
+        from services.mcp_tool_index import mcp_tool_index
+
+        if not mcp_tool_index.is_built:
+            logger.warning("ToolIndex 未构建，回退到全量工具列表")
+            return self.get_all_tools()
+
+        if not query or not query.strip():
+            logger.debug("get_relevant_tool_schemas: query 为空，返回空列表")
+            return []
+
+        # 检索相关工具名
+        relevant_tool_names = mcp_tool_index.retrieve(query, top_k=top_k)
+        if not relevant_tool_names:
+            logger.debug(f"get_relevant_tool_schemas: query={query!r} 未检索到相关工具")
+            return []
+
+        # 根据 tool_full_name 找回完整 schema
+        # 构建 full_name → tool_schema 的映射
+        result: List[Dict[str, Any]] = []
+        for full_name in relevant_tool_names:
+            meta = mcp_tool_index.get_tool_meta(full_name)
+            if not meta:
+                continue
+            server_name, original_name = meta
+            tools = self._tools.get(server_name, [])
+            for tool in tools:
+                if tool.name == original_name:
+                    result.append({
+                        "name": full_name,
+                        "description": f"[MCP/{server_name}] {tool.description or tool.name}",
+                        "parameters": tool.inputSchema if tool.inputSchema else {
+                            "type": "object",
+                            "properties": {},
+                            "required": [],
+                        },
+                    })
+                    break
+
+        logger.info(
+            f"ToolIndex 按需加载: query={query!r}, 检索到 {len(result)}/{top_k} 个工具: "
+            f"{[r['name'] for r in result]}"
+        )
+        return result
 
     async def list_tools_detail(self, server_name: Optional[str] = None) -> dict:
         """列出工具详情（供 mcp_list_tools 元工具调用）
@@ -692,6 +1193,10 @@ class MCPClientManager:
     async def shutdown(self) -> None:
         """关闭所有 session 和 transport"""
         logger.info("MCP 正在关闭所有连接...")
+
+        # v2 新增：停止健康检查任务
+        self._shutting_down = True
+        self._stop_health_check_task()
 
         for server_name in list(self._server_configs.keys()):
             await self._cleanup_server(server_name)

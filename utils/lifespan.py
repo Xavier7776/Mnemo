@@ -87,12 +87,19 @@ async def lifespan(app: FastAPI):
                 if enable_reranker:
                     logger.info("正在预热重排模型...")
                     from retrieval.rag_retriever import RAGRetriever
-                    # 创建临时实例触发模型加载
+                    # 创建临时实例触发模型加载，并复用到 EvidenceVerifier 做分层验证
+                    warmup_retriever = RAGRetriever()
                     def _warmup_reranker():
-                        retriever = RAGRetriever()
-                        retriever._get_reranker()
-                    await asyncio.to_thread(_warmup_reranker)
+                        return warmup_retriever._get_reranker()
+                    reranker = await asyncio.to_thread(_warmup_reranker)
                     logger.info("重排模型预热完成")
+
+                    # 如果启用证据验证的 CrossEncoder 分层确认，注入已加载的 reranker
+                    use_ce_verify = os.getenv("VERIFIER_USE_CROSS_ENCODER", "0").strip().lower() in {"1", "true", "yes", "on"}
+                    if use_ce_verify and reranker is not None:
+                        from services.evidence_verifier import evidence_verifier
+                        evidence_verifier.attach_cross_encoder(reranker)
+                        logger.info("EvidenceVerifier 已注入 CrossEncoder，启用分层证据验证")
             except Exception as e:
                 logger.warning(f"重排模型预热失败（不影响服务启动）: {e}")
 

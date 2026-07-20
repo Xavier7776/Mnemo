@@ -9,7 +9,7 @@ services:
     environment:
       MONGO_INITDB_ROOT_USERNAME: admin
       MONGO_INITDB_ROOT_PASSWORD: admin123
-      MONGO_INITDB_DATABASE: advanced_rag
+      MONGO_INITDB_DATABASE: mnemo
     volumes:
       - mongodb_data:/data/db
       - mongodb_config:/data/configdb
@@ -63,7 +63,8 @@ services:
     ports:
       - "6379:6379"     # Redis 主端口
       - "8001:8001"     # RedisInsight（Web UI）
-    command: ["redis-server", "--appendonly", "yes"]
+    # 不在启动参数里强制 --appendonly yes，避免 AOF 空文件覆盖 RDB 数据
+    # AOF 通过 CONFIG SET appendonly yes 在运行时按需开启
     volumes:
       - redis_data:/data
     networks:
@@ -75,22 +76,31 @@ services:
       retries: 5
 
 volumes:
+  # external: 复用 mnemo 项目的旧 volume，数据零丢失迁移
   mongodb_data:
-    driver: local
+    external: true
+    name: mnemo_mongodb_data
   mongodb_config:
-    driver: local
+    external: true
+    name: mnemo_mongodb_config
   qdrant_data:
-    driver: local
+    external: true
+    name: mnemo_qdrant_data
   neo4j_data:
-    driver: local
+    external: true
+    name: mnemo_neo4j_data
   neo4j_logs:
-    driver: local
+    external: true
+    name: mnemo_neo4j_logs
   neo4j_import:
-    driver: local
+    external: true
+    name: mnemo_neo4j_import
   neo4j_plugins:
-    driver: local
+    external: true
+    name: mnemo_neo4j_plugins
   redis_data:
-    driver: local
+    external: true
+    name: mnemo_redis_data
 
 networks:
   mnemo-network:

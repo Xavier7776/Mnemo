@@ -106,6 +106,7 @@ class GeneralAssistantAgent(BaseAgent):
                 "assistant_id": assistant_id,
                 "knowledge_space_ids": knowledge_space_ids,
                 "embedding_model": embedding_model,
+                "query_plan": None,  # 前置 Plan 会被注入到这里，供 rag_retrieve 工具复用
                 "retrieval_context": {
                     "seen_chunk_ids": set(),       # 跨轮次去重
                     "total_retrieval_count": 0,    # 已检索次数
@@ -117,6 +118,115 @@ class GeneralAssistantAgent(BaseAgent):
             }
             logger.info(f"GeneralAssistantAgent: Agentic RAG 模式（Plan-Act-Observe-Reflect），Agent 将自主决定是否调用 rag_retrieve 工具")
 
+        # —— 前置检索参数规划（不是 reasoning）：生成 final_k/prefetch_k/fusion_strategy 等结构化参数 ——
+        # 职责区分：
+        #   - 这里的 build_plan：产出 LLM reasoning 不会生成的结构化检索参数
+        #   - PAOR 循环里的 P（LLM reasoning）：LLM 实时决策要不要调工具、调什么参数
+        # 两者不冲突：前置规划产出参数，LLM reasoning 决定是否使用
+        #
+        # 规划模式由环境变量 AGENT_PLANNER_MODE 控制（默认 auto）：
+        #   - auto：智能选择。短查询/明确意图用规则引擎（毫秒级），长查询/复杂结构用 LLM（更准）
+        #   - rules：强制规则引擎，毫秒级
+        #   - llm：强制 LLM 判断，最准但每次增加 ~1-3s 延迟
+        plan = None
+        pre_retrieval_hint = ""  # 给 LLM 的规划提示（注入 context）
+        if enable_rag:
+            try:
+                from services.query_planner import query_planner
+                from services.runtime_config import get_runtime_config
+
+                runtime_cfg = await get_runtime_config()
+                runtime_modules = runtime_cfg.get("modules") or {}
+                runtime_params = runtime_cfg.get("params") or {}
+
+                # 读环境变量决定规划模式（默认 auto：智能选择）
+                agent_planner_mode = os.getenv("AGENT_PLANNER_MODE", "auto").lower()
+
+                plan = await query_planner.build_plan(
+                    query=task,
+                    runtime_modules=runtime_modules,
+                    runtime_params=runtime_params,
+                    filters={
+                        "document_id": document_id,
+                        "assistant_id": assistant_id,
+                        "knowledge_space_ids": knowledge_space_ids or [],
+                    },
+                    planner_mode=agent_planner_mode,
+                )
+                query_plan = plan.model_dump()
+                # 注入到 tool_execution_context，让 rag_retrieve 工具复用 plan 的参数
+                if tool_execution_context is not None:
+                    tool_execution_context["query_plan"] = plan
+                logger.info(
+                    f"GeneralAssistantAgent: 前置参数规划完成 "
+                    f"(mode={agent_planner_mode}, intent={plan.intent}, source={plan.planner_source}, "
+                    f"final_k={plan.final_k}, prefetch_k={plan.prefetch_k}, "
+                    f"fusion={plan.fusion_strategy})"
+                )
+
+                # —— 条件预检索：复杂查询（compare/summary/clause/verification）才预检索 ——
+                # 简单查询（general）让 LLM 自主决定是否调 rag_retrieve，避免增加首轮延迟
+                if plan.intent != "general":
+                    try:
+                        from services.rag_service import rag_service
+                        pre_result = await rag_service.retrieve_context(
+                            query=task,
+                            document_id=document_id,
+                            assistant_id=assistant_id,
+                            knowledge_space_ids=knowledge_space_ids,
+                            embedding_model=embedding_model,
+                            strategy="auto",
+                            plan=plan,  # 复用上面的 plan，避免重复规划
+                        )
+                        # 把预检索结果作为初始 context（让 LLM 首轮就能看到证据）
+                        pre_context = pre_result.get("context", "")
+                        if pre_context:
+                            rag_context = pre_context
+                        # 把预检索 evidence 注入 collected_evidence，供 Agent 阶段三回收
+                        pre_evidence = pre_result.get("evidence", [])
+                        retrieval_ctx = tool_execution_context["retrieval_context"] if tool_execution_context else None
+                        if retrieval_ctx is not None and pre_evidence:
+                            for ev in pre_evidence:
+                                cid = ev.get("chunk_id", "")
+                                if cid and cid in retrieval_ctx["seen_chunk_ids"]:
+                                    continue
+                                if cid:
+                                    retrieval_ctx["seen_chunk_ids"].add(cid)
+                                retrieval_ctx["collected_evidence"].append({
+                                    "chunk_id": cid,
+                                    "content": ev.get("text", ""),
+                                    "document_title": ev.get("document_title", ""),
+                                    "document_id": ev.get("document_id", ""),
+                                    "score": ev.get("score", 0.0),
+                                    "retrieval_type": "pre_retrieval",
+                                    "verified": True,  # 预检索结果默认可信
+                                    "relevance_score": ev.get("score", 0.0),
+                                    "retrieved_at_round": 0,  # 标记为预检索
+                                    "section_path": ev.get("section_path", []),
+                                })
+                            # 预检索不计入 total_retrieval_count（那是 LLM 工具调用次数）
+                            logger.info(
+                                f"GeneralAssistantAgent: 预检索完成 (intent={plan.intent}), "
+                                f"注入 {len(pre_evidence)} 条初始证据, "
+                                f"context 长度 {len(pre_context)} 字符"
+                            )
+                        # 构建给 LLM 的规划提示
+                        pre_retrieval_hint = (
+                            f"【检索参数】意图={plan.intent}, final_k={plan.final_k}, "
+                            f"已预检索 {len(pre_evidence)} 条证据。如需补充，调用 rag_retrieve 工具换关键词重试。"
+                        )
+                    except Exception as e:
+                        logger.warning(f"GeneralAssistantAgent: 预检索失败，降级到无预检索模式: {e}")
+                else:
+                    # general 意图：不预检索，LLM reasoning 自主决定
+                    pre_retrieval_hint = (
+                        f"【检索参数】意图={plan.intent}, final_k={plan.final_k}。"
+                        f"如需检索，调用 rag_retrieve 工具。"
+                    )
+            except Exception as e:
+                logger.warning(f"GeneralAssistantAgent: 前置参数规划失败，降级到无 Plan 的 PAOR: {e}")
+                plan = None
+
         # 2. 使用 LLM 生成回复
         try:
             full_response = ""
@@ -126,11 +236,22 @@ class GeneralAssistantAgent(BaseAgent):
                     "请优先依据以下证据回答，并在关键事实后使用 [S1]、[S2] 这类证据编号。"
                     "如果资料中找不到支持信息，请明确说明“资料中未找到”。\n\n"
                 )
+            # 把前置 Plan 的提示拼到 context 前面，让 LLM 首轮就知道规划意图
+            # 如果有预检索证据：evidence_instruction + rag_context（证据）+ pre_retrieval_hint（规划提示）
+            # 如果只有 Plan 无预检索：pre_retrieval_hint（规划提示）
+            # 如果 Plan 失败：context=None（降级到当前行为）
+            context_for_llm = None
+            if rag_context:
+                context_for_llm = evidence_instruction + rag_context
+                if pre_retrieval_hint:
+                    context_for_llm += "\n\n" + pre_retrieval_hint
+            elif pre_retrieval_hint:
+                context_for_llm = pre_retrieval_hint
             # LLMService.generate 会自动构建包含 context 的 prompt
             buffer_chunk = ""
             async for chunk in self.llm_service.generate(
                 prompt=task,
-                context=(evidence_instruction + rag_context) if rag_context else None,
+                context=context_for_llm,
                 stream=stream,
                 document_id=document_id,
                 # document_info=document_info, # 可以根据需要获取并传入

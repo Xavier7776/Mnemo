@@ -45,6 +45,43 @@ def get_chunk_repo():
     return chunk_repo
 
 
+def _resolve_collection_name(doc: Optional[Dict[str, Any]]) -> str:
+    """根据文档记录推导对应的 Qdrant 集合名
+
+    BUG 修复：原 delete_document 直接用全局单例 qdrant_client（默认 mnemo_knowledge），
+    但上传时向量写入的是知识空间/助手对应的集合（default_knowledge 或其他），
+    集合错配导致 Qdrant 向量永久残留。
+
+    与 retry_document_processing 第 1369-1396 行逻辑保持一致。
+    """
+    if not doc:
+        return "default_knowledge"
+
+    # 优先用 knowledge_space_id
+    knowledge_space_id = doc.get("knowledge_space_id")
+    assistant_id = doc.get("assistant_id")
+    if not knowledge_space_id and assistant_id:
+        knowledge_space_id = assistant_id
+
+    if not knowledge_space_id:
+        return "default_knowledge"
+
+    try:
+        from bson import ObjectId
+        assistant_collection = mongodb.get_collection("course_assistants")
+        try:
+            oid = ObjectId(knowledge_space_id) if isinstance(knowledge_space_id, str) else knowledge_space_id
+            assistant_doc = assistant_collection.find_one({"_id": oid})
+            if assistant_doc:
+                return assistant_doc.get("collection_name", "default_knowledge")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    return "default_knowledge"
+
+
 def _parse_pdf_with_progress(file_path: str, doc_repo, doc_id: str) -> dict:
     """带进度显示的PDF解析"""
     import PyPDF2
@@ -408,7 +445,44 @@ def process_document_background(
             pass
         
         logger.info(f"文档分块完成 - 文档ID: {doc_id}, 块数量: {len(chunks)}")
-        
+
+        # Phase 2 优化：元数据前缀增强
+        # 给每个 chunk text 加前缀 [文档标题 > 章节]，让向量编码和 BM25 索引都能命中标题词
+        # 这对英文专有名词（如 GPT-Researcher、WrittenContentCompressor）尤其有效
+        # 同时为 LLM context 提供上下文，答题更准
+        try:
+            doc_record = doc_repo.get_document(doc_id)
+            doc_title = (doc_record or {}).get("title") or ""
+            # 去掉文件扩展名（title 通常来自 filename，含扩展名）
+            if "." in doc_title:
+                doc_title = os.path.splitext(doc_title)[0]
+            doc_title = doc_title.strip()
+
+            if doc_title:
+                enhanced_count = 0
+                for c in chunks:
+                    if not isinstance(c, dict):
+                        continue
+                    c_meta = c.get("metadata") or {}
+                    section_path = c_meta.get("section_path")
+                    # 构建前缀：文档标题 > 最后 2 级章节
+                    prefix_parts = [doc_title]
+                    if isinstance(section_path, list) and section_path:
+                        # 取最后 2 级章节，避免前缀过长稀释语义
+                        prefix_parts.extend(str(s).strip() for s in section_path[-2:] if str(s).strip())
+                    elif section_path:
+                        prefix_parts.append(str(section_path).strip())
+                    prefix = " > ".join(p for p in prefix_parts if p)
+                    # 加前缀到 chunk text（向量化、MongoDB、Qdrant、Redis 都会使用带前缀的 text）
+                    original_text = c.get("text", "") or ""
+                    c["text"] = f"[{prefix}]\n{original_text}"
+                    enhanced_count += 1
+                logger.info(f"元数据前缀增强完成 - 文档ID: {doc_id}, 标题: {doc_title}, 增强块数: {enhanced_count}")
+            else:
+                logger.warning(f"元数据前缀增强跳过（文档标题为空）- 文档ID: {doc_id}")
+        except Exception as e:
+            logger.warning(f"元数据前缀增强失败（不影响主流程）: {e}")
+
         # 记录分块结果预览
         if chunks:
             first_chunk_preview = chunks[0].get("text", "")[:100] if chunks[0].get("text") else "(空)"
@@ -591,9 +665,9 @@ def process_document_background(
                 from pymongo import MongoClient
                 from bson import ObjectId
                 import os
-                mongodb_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017/advanced_rag")
+                mongodb_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017/mnemo")
                 sync_client = MongoClient(mongodb_uri)
-                db_name = os.getenv("MONGODB_DB_NAME", "advanced_rag")
+                db_name = os.getenv("MONGODB_DB_NAME", "mnemo")
                 db = sync_client[db_name]
                 
                 # 知识空间查找：先按 ObjectId 直查，失败则按 name 兜底（允许传中文名）
@@ -857,7 +931,9 @@ async def upload_document(
         )
     
     # 保存文件并计算哈希
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
+    # basename 清洗，防止文件名带路径分隔符（路径遍历防护）
+    safe_filename = os.path.basename((file.filename or "unknown").replace("\\", "/")) or "unknown"
+    file_path = os.path.join(UPLOAD_DIR, safe_filename)
     file_hash = None
     
     try:
@@ -1033,7 +1109,11 @@ async def upload_documents_batch(
     duplicated_count = 0
 
     for file in files:
-        filename = file.filename or "unknown"
+        # 用 basename 清洗，防止客户端传带路径分隔符的文件名
+        # （webkitdirectory 场景下浏览器可能传 "XavierWarehouse/index.md" 这种相对路径，
+        # 会导致 os.path.join 拼接出不存在的子目录，触发 FileNotFoundError）
+        raw_filename = file.filename or "unknown"
+        filename = os.path.basename(raw_filename.replace("\\", "/")) or "unknown"
         file_ext = os.path.splitext(filename)[1].lower()
 
         try:
@@ -1633,11 +1713,27 @@ async def delete_document(
             logger.warning(f"清理chunks失败 - 文档ID: {doc_id}, 错误: {str(e)}")
         
         # 3. 清理vectors（Qdrant）- 即使文档不存在也尝试清理
+        # BUG 修复：原代码直接用全局单例 qdrant_client（默认 mnemo_knowledge 集合），
+        # 但上传时向量写入的是知识空间对应的集合，导致删除错集合、向量永久残留。
+        # 改为先推导文档实际所属集合，再调用对应集合的 client 删除。
+        collection_name = _resolve_collection_name(doc)
         try:
-            qdrant_client.delete_by_document_id(doc_id)
-            logger.info(f"已清理文档的vectors - 文档ID: {doc_id}")
+            from database.qdrant_client import get_qdrant_client
+            qdrant_client_instance = get_qdrant_client(collection_name)
+            qdrant_client_instance.delete_by_document_id(doc_id)
+            logger.info(f"已清理文档的vectors - 文档ID: {doc_id}, 集合: {collection_name}")
         except Exception as e:
-            logger.warning(f"清理vectors失败 - 文档ID: {doc_id}, 错误: {str(e)}")
+            logger.warning(f"清理vectors失败 - 文档ID: {doc_id}, 集合: {collection_name}, 错误: {str(e)}")
+
+        # 3.5 清理 Neo4j 图谱数据（如果启用）
+        # BUG 修复：原代码完全不清理 Neo4j，导致孤儿节点累积、污染图谱检索。
+        neo4j_enabled = os.getenv("NEO4J_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+        if neo4j_enabled:
+            try:
+                from database.neo4j_client import neo4j_client
+                neo4j_client.delete_by_document_id(doc_id)
+            except Exception as e:
+                logger.warning(f"清理 Neo4j 图谱失败 - 文档ID: {doc_id}, 错误: {str(e)}")
         
         # 4. 删除文件（如果存在）
         if file_path and os.path.exists(file_path):

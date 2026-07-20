@@ -24,6 +24,7 @@ class RAGService:
         top_k: Optional[int] = None,
         min_score: Optional[float] = None,
         exclude_chunk_ids: Optional[set] = None,
+        plan: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         检索相关上下文（并行检索文档和资源）
@@ -39,6 +40,7 @@ class RAGService:
             top_k: 覆盖 query_planner 的 final_k（若提供）
             min_score: 覆盖默认的 score_threshold（若提供）
             exclude_chunk_ids: 需排除的 chunk_id 集合（Agent 跨轮次去重）
+            plan: 可选的 QueryPlan 对象，若提供则跳过内部 build_plan（避免重复规划）
 
         Returns:
             包含上下文、来源信息和推荐资源的字典
@@ -58,18 +60,25 @@ class RAGService:
             params = {}
             rerank_enabled = True
         # query_planner（阶段二：LLM 驱动 + 规则 fallback）
-        from services.query_planner import query_planner
-        plan = await query_planner.build_plan(
-            query,
-            runtime_modules=modules,
-            runtime_params=params,
-            filters={
-                "document_id": document_id,
-                "assistant_id": assistant_id,
-                "collection_name": collection_name,
-                "knowledge_space_ids": knowledge_space_ids or [],
-            },
-        )
+        # 如果调用方已传入 plan（如对话路径前置规划），直接复用，避免重复调用 LLM
+        if plan is not None:
+            logger.debug(f"retrieve_context: 复用调用方传入的 plan (intent={plan.intent}, source={plan.planner_source})")
+        else:
+            from services.query_planner import query_planner
+            # retrieval.py API 路径：按 QUERY_PLANNER_MODE 环境变量走（默认 LLM）
+            # 对话路径（Agent）会传入已规划好的 plan，不会走到这里
+            plan = await query_planner.build_plan(
+                query,
+                runtime_modules=modules,
+                runtime_params=params,
+                filters={
+                    "document_id": document_id,
+                    "assistant_id": assistant_id,
+                    "collection_name": collection_name,
+                    "knowledge_space_ids": knowledge_space_ids or [],
+                },
+                planner_mode="env",  # retrieval.py API 路径：按 QUERY_PLANNER_MODE 走（默认 LLM）
+            )
         #塞进日志
         trace["query_plan"] = plan.model_dump()
         # 解析需要检索的集合列表（知识空间优先）

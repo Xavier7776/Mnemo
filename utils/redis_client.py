@@ -26,18 +26,39 @@ _redis_client = None
 _redis_unavailable = False
 _redisearch_available = False
 _index_ready = False
+# 上次连接失败时间戳（秒），用于限制重试频率
+_last_fail_ts: float = 0.0
+# 重试间隔（秒）：连接失败后至少等待这么久才重试，避免日志刷屏
+_RETRY_INTERVAL = 30.0
 
 INDEX_NAME = "rag_chunk_idx"
 PREFIX = "rag:chunk:"
 
 
 def get_redis_client():
-    """获取全局 Redis 客户端（惰性初始化）"""
-    global _redis_client, _redis_unavailable, _redisearch_available
+    """获取全局 Redis 客户端（惰性初始化，失败后可重试）"""
+    global _redis_client, _redis_unavailable, _redisearch_available, _last_fail_ts
+    import time as _time
+
     if _redis_client is not None:
-        return _redis_client
+        # 已有客户端，检查连接是否还活着
+        try:
+            _redis_client.ping()
+            return _redis_client
+        except Exception:
+            # 连接断了，重置客户端，走重连逻辑
+            _redis_client = None
+            _redisearch_available = False
+            _index_ready = False
+
     if _redis_unavailable:
-        return None
+        # 限频重试：距离上次失败不足 _RETRY_INTERVAL 秒则跳过
+        if _time.time() - _last_fail_ts < _RETRY_INTERVAL:
+            return None
+        # 超过重试间隔，清除不可用标记，重新尝试
+        _redis_unavailable = False
+        logger.info("Redis 重试连接中（之前标记为不可用，已过重试间隔）...")
+
     try:
         import os
         import redis
@@ -71,22 +92,19 @@ def get_redis_client():
     except ImportError:
         logger.warning("redis 库未安装，BM25 倒排索引不可用")
         _redis_unavailable = True
+        _last_fail_ts = _time.time()
         return None
     except Exception as e:
         logger.warning(f"Redis 连接失败: {e}")
         _redis_unavailable = True
+        _last_fail_ts = _time.time()
         return None
 
 
 def _tokenize(text: str) -> List[str]:
-    """jieba 分词"""
-    clean = (text or "").lower()
-    try:
-        import jieba
-        tokens = [t.strip() for t in jieba.cut(clean) if t.strip()]
-    except Exception:
-        tokens = re.findall(r"[\w\u4e00-\u9fff]+", clean)
-    return [t for t in tokens if len(t) > 1 or re.match(r"[\u4e00-\u9fff]", t)]
+    """Phase 3 优化：统一走 utils/tokenizer.py，支持驼峰切分 + 专有名词词典"""
+    from utils.tokenizer import tokenize_for_index
+    return tokenize_for_index(text)
 
 
 def _ensure_index():
@@ -161,7 +179,11 @@ def search_bm25(
     k1: float = 1.5,
     b: float = 0.75,
 ) -> List[Tuple[str, float]]:
-    """用 RediSearch BM25 检索
+    """用 RediSearch BM25 检索（Phase 3 优化：加权 token 查询）
+
+    Args:
+        query_terms: 查询 token 列表（已过滤停用词，来自 tokenize_for_query）
+                     也支持 [(token, weight), ...] 加权形式
 
     Returns: [(chunk_id, score), ...] 按 score 降序
     """
@@ -174,15 +196,22 @@ def search_bm25(
         return []
 
     try:
-        # 构造查询字符串
-        # 清洗 token：过滤掉包含 RediSearch 特殊字符的 token
-        # RediSearch 特殊字符: ,.<>{}[]"':;!@#$%^&*()-+=~  等
+        # Phase 3 优化：驼峰切分 + 纯 OR 语义
+        # 策略：切分后所有 token 用 OR 连接，BM25 自动按匹配数和 IDF 打分
+        # 英文 token（驼峰切分出的代码标识符）IDF 高，自然获得更高权重
         import re as _re
         clean_terms = []
-        for t in query_terms:
+        for item in query_terms:
+            # 兼容两种输入：纯 token 或 (token, weight) 元组
+            if isinstance(item, (tuple, list)) and len(item) == 2:
+                t, _w = item
+                t = str(t)
+            else:
+                t = str(item)
             # 只保留字母、数字、中文
-            if _re.match(r"^[\w\u4e00-\u9fff]+$", t):
-                clean_terms.append(t)
+            if not _re.match(r"^[\w\u4e00-\u9fff]+$", t):
+                continue
+            clean_terms.append(t)
         if not clean_terms:
             return []
         # OR 语义，BM25 会自动给匹配更多词的文档更高分

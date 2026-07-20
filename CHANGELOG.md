@@ -90,8 +90,8 @@
 
 ---
 
-[Unreleased]: https://github.com/iammm0/advanced-rag/compare/v0.8.5...HEAD
-[0.8.5]: https://github.com/iammm0/advanced-rag/compare/v0.8.0...v0.8.5
-[0.8.0]: https://github.com/iammm0/advanced-rag/compare/v0.7.0...v0.8.0
-[0.7.0]: https://github.com/iammm0/advanced-rag/compare/v0.6.0...v0.7.0
-[0.6.0]: https://github.com/iammm0/advanced-rag/releases/tag/v0.6.0
+[Unreleased]: https://github.com/iammm0/mnemo/compare/v0.8.5...HEAD
+[0.8.5]: https://github.com/iammm0/mnemo/compare/v0.8.0...v0.8.5
+[0.8.0]: https://github.com/iammm0/mnemo/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/iammm0/mnemo/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/iammm0/mnemo/releases/tag/v0.6.0

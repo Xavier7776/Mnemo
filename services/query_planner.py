@@ -54,36 +54,104 @@ class QueryPlanner:
         runtime_modules: Optional[Dict[str, Any]] = None,
         runtime_params: Optional[Dict[str, Any]] = None,
         filters: Optional[Dict[str, Any]] = None,
+        planner_mode: str = "auto",
     ) -> QueryPlan:
         """构建检索计划（async，因为 LLM 调用是异步的）
 
-        根据 QUERY_PLANNER_MODE 环境变量决定走 LLM 还是规则引擎。
-        LLM 模式下超时或失败时自动 fallback 到规则引擎。
+        Args:
+            planner_mode: 规划模式，三选一
+                - "auto"（默认）：智能选择。短查询/明确意图用规则引擎（毫秒级），
+                  长查询/复杂结构用 LLM（更准但慢）。兼顾速度和准确性。
+                - "rules"：强制规则引擎，毫秒级，不调 LLM。
+                - "llm"：强制 LLM 判断，最准但每次增加 ~1-3s 延迟。
+                - "env"：按 QUERY_PLANNER_MODE 环境变量走（兼容旧用法）。
         """
-        mode = self.mode
+        mode = planner_mode.lower()
+
+        # auto 模式：根据 query 复杂度智能选择
+        if mode == "auto":
+            if self._query_needs_llm(query):
+                logger.debug(f"QueryPlanner[auto]: query 复杂，用 LLM 规划 (len={len(query)})")
+                # 走 LLM 路径（下方处理）
+                mode = "llm"
+            else:
+                logger.debug(f"QueryPlanner[auto]: query 简单，用规则引擎 (len={len(query)})")
+                plan = self._build_plan_rules(query, runtime_modules, runtime_params, filters)
+                return plan
+
+        # rules 模式：强制规则引擎
         if mode == "rules":
             return self._build_plan_rules(query, runtime_modules, runtime_params, filters)
 
-        # LLM 模式：先尝试 LLM，失败 fallback
-        try:
-            plan = await asyncio.wait_for(
-                self._build_plan_llm(query, runtime_modules, runtime_params, filters),
-                timeout=float(os.getenv("PLANNER_TIMEOUT", "20.0")),
-            )
-            logger.info(f"QueryPlanner: LLM 规划完成 (intent={plan.intent}, sub_queries={len(plan.sub_queries)}, rewritten={len(plan.rewritten_queries)})")
-            if plan.rewritten_queries:
-                for i, rq in enumerate(plan.rewritten_queries, 1):
-                    logger.info(f"QueryPlanner: rewrite[{i}] = {rq}")
-            if plan.sub_queries:
-                for i, sq in enumerate(plan.sub_queries, 1):
-                    logger.info(f"QueryPlanner: sub_query[{i}] = {sq}")
-            return plan
-        except asyncio.TimeoutError:
-            logger.warning(f"QueryPlanner: LLM 规划超时({os.getenv('PLANNER_TIMEOUT', '20.0')}s)，fallback 到规则引擎")
-        except Exception as e:
-            logger.warning(f"QueryPlanner: LLM 规划失败: {e}，fallback 到规则引擎")
+        # env 模式：按 QUERY_PLANNER_MODE 环境变量走（兼容 retrieval.py 旧用法）
+        if mode == "env":
+            mode = self.mode
+
+        # LLM 模式：先尝试 LLM，失败 fallback 到规则引擎
+        if mode == "llm":
+            try:
+                plan = await asyncio.wait_for(
+                    self._build_plan_llm(query, runtime_modules, runtime_params, filters),
+                    timeout=float(os.getenv("PLANNER_TIMEOUT", "20.0")),
+                )
+                logger.info(f"QueryPlanner[llm]: LLM 规划完成 (intent={plan.intent}, sub_queries={len(plan.sub_queries)}, rewritten={len(plan.rewritten_queries)})")
+                if plan.rewritten_queries:
+                    for i, rq in enumerate(plan.rewritten_queries, 1):
+                        logger.info(f"QueryPlanner: rewrite[{i}] = {rq}")
+                if plan.sub_queries:
+                    for i, sq in enumerate(plan.sub_queries, 1):
+                        logger.info(f"QueryPlanner: sub_query[{i}] = {sq}")
+                return plan
+            except asyncio.TimeoutError:
+                logger.warning(f"QueryPlanner: LLM 规划超时({os.getenv('PLANNER_TIMEOUT', '20.0')}s)，fallback 到规则引擎")
+            except Exception as e:
+                logger.warning(f"QueryPlanner: LLM 规划失败: {e}，fallback 到规则引擎")
 
         return self._build_plan_rules(query, runtime_modules, runtime_params, filters)
+
+    def _query_needs_llm(self, query: str) -> bool:
+        """判断 query 是否需要 LLM 规划（auto 模式的决策逻辑）
+
+        规则引擎足够的情况（返回 False）：
+        - 命中明确意图关键词（"对比/比较/有哪些/条款/定义"等）
+        - 极短查询（<=15 字）且单句：即使误判为 general 影响也小
+
+        需要 LLM 的情况（返回 True）：
+        - 长查询（>40 字）：可能包含多重意图，规则引擎关键词匹配会漏
+        - 多句查询（含多个问号/分号）：可能是复合问题
+        - 中等长度（16-40 字）且无明确关键词：规则引擎会误判为 general
+        """
+        q = (query or "").strip()
+        if not q:
+            return False
+
+        # 明确意图关键词命中：规则引擎足够准确
+        explicit_keywords = (
+            "对比", "比较", "差异", "优缺点", "优劣", "分别", "各自", "区别", "相同点", "不同点",
+            "有哪些", "列举", "总结", "概括", "要点", "关键点", "核心观点",
+            "条款", "规定", "标准", "定义", "范围", "假设", "条件",
+            "风险", "限制", "不足", "漏洞",
+        )
+        has_explicit = any(k in q for k in explicit_keywords)
+
+        # 命中明确关键词：规则引擎足够（无论长度）
+        if has_explicit:
+            return False
+
+        # 极短查询（<=15 字）+ 单句：即使误判为 general 影响也小，规则引擎够用
+        if len(q) <= 15 and q.count("？") + q.count("?") <= 1:
+            return False
+
+        # 长查询（>40 字）：可能多重意图，用 LLM
+        if len(q) > 40:
+            return True
+
+        # 多句查询：复合问题，用 LLM
+        if q.count("？") + q.count("?") >= 2 or q.count("；") + q.count(";") >= 2:
+            return True
+
+        # 中等长度（16-40 字）且无明确关键词：规则引擎会误判为 general，用 LLM
+        return True
 
     # ==================== LLM 驱动 ====================
 
