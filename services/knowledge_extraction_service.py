@@ -35,6 +35,10 @@ class KnowledgeExtractionService:
   ...
 ]
 
+重要约束：
+- 最多提取 8 个最核心的三元组，不要贪多（避免输出被截断）
+- 只提取明确表述的关系，不要推断或猜测
+
 【实体类型】必须是以下 7 种之一（不允许自由发挥）：
 - Concept: 概念、理论、思想、原理
 - Technology: 技术、工具、框架、平台、系统
@@ -83,7 +87,7 @@ class KnowledgeExtractionService:
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,
-                max_tokens=2000,
+                max_tokens=4096,
                 timeout=120
             )
             return response.choices[0].message.content or ""
@@ -101,6 +105,10 @@ class KnowledgeExtractionService:
 
         LLM 输出经常前后带自然语言解释、用非标准 json 代码块、或者返回
         "无实体" 这类纯文本。这里依次尝试多种策略，尽量把 JSON 抠出来。
+
+        特殊处理：reasoning model（如 mimo-v2.5）可能因 max_tokens 不足导致
+        JSON 数组被截断（有 `[` 无 `]`，最后一个对象不完整）。此时逐个提取
+        已完整的 `{...}` 对象， salvage 部分结果。
         """
         if not content or not content.strip():
             return []
@@ -136,6 +144,15 @@ class KnowledgeExtractionService:
             except Exception:
                 pass
 
+        # 策略 4：截断 JSON 数组 salvage（reasoning model 输出被 max_tokens 截断）
+        # 场景：LLM 输出了 `[ {完整对象}, {完整对象}, {截断对象` 但没有闭合 `]`
+        # 处理：逐个提取完整的 {...} 对象，跳过最后一个不完整的
+        if parsed is None:
+            salvaged = self._salvage_truncated_json_array(content)
+            if salvaged:
+                logger.info(f"截断 JSON salvage 成功: 提取 {len(salvaged)} 个完整对象")
+                parsed = salvaged
+
         if parsed is None:
             logger.warning(f"无法解析 JSON: {content[:100]}...")
             return []
@@ -147,11 +164,98 @@ class KnowledgeExtractionService:
         logger.warning(f"JSON 解析结果不是列表或字典: {type(parsed)}")
         return []
 
+    def _salvage_truncated_json_array(self, content: str) -> List[Any]:
+        """从截断的 JSON 数组中提取已完整的元素。
+
+        处理 reasoning model 输出被 max_tokens 截断的情况，支持两种格式：
+        1. 对象数组: '[\n  {"head": "a", ...},\n  {"head": "b", ...},\n  {"head": "c"（截断）
+           输出: [{"head": "a", ...}, {"head": "b", ...}]
+        2. 字符串数组: '["entity1", "entity2", "enti（截断）
+           输出: ["entity1", "entity2"]
+
+        策略：逐字符扫描，用引号/括号深度判断元素边界。
+        """
+        # 找到第一个 [
+        start = content.find('[')
+        if start == -1:
+            return []
+
+        # 尝试逐个提取完整的 JSON 元素（对象或字符串）
+        elements = []
+        i = start + 1
+        n = len(content)
+
+        while i < n:
+            # 跳过空白和逗号
+            while i < n and content[i] in ' \t\n\r,':
+                i += 1
+            if i >= n:
+                break
+
+            ch = content[i]
+            if ch == ']':
+                # 数组正常结束
+                break
+            elif ch == '{':
+                # 对象元素：找到匹配的 }
+                depth = 0
+                obj_start = i
+                while i < n:
+                    if content[i] == '{':
+                        depth += 1
+                    elif content[i] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            obj_str = content[obj_start:i + 1]
+                            try:
+                                obj = json.loads(obj_str)
+                                if isinstance(obj, dict):
+                                    elements.append(obj)
+                            except json.JSONDecodeError:
+                                pass
+                            i += 1
+                            break
+                    i += 1
+                # 如果 depth > 0 到结尾，说明对象被截断
+                if depth > 0:
+                    break
+            elif ch == '"':
+                # 字符串元素：找到匹配的结束引号（处理转义）
+                str_start = i
+                i += 1  # 跳过开引号
+                while i < n:
+                    if content[i] == '\\':
+                        i += 2  # 跳过转义字符
+                        continue
+                    if content[i] == '"':
+                        # 找到结束引号
+                        str_str = content[str_start:i + 1]
+                        try:
+                            s = json.loads(str_str)
+                            if isinstance(s, str):
+                                elements.append(s)
+                        except json.JSONDecodeError:
+                            pass
+                        i += 1
+                        break
+                    i += 1
+                # 如果到结尾还没找到结束引号，说明字符串被截断
+                else:
+                    break
+            else:
+                # 数字、true/false/null 等（实体提取不会用到，跳过）
+                i += 1
+
+        return elements
+
     async def extract_entities(self, query: str) -> List[str]:
         """从查询中提取实体（用 asyncio.to_thread 包装同步调用，避免阻塞事件循环）"""
         prompt = f"""请从以下查询中提取关键实体（人名、地名、组织、概念、技术术语等）。
 只返回实体列表，JSON 格式：["实体1", "实体2"]。
-不要包含任何解释。
+重要约束：
+- 最多提取 5 个最核心的实体，不要贪多（避免输出被截断）
+- 实体名要简洁（1-5个词），不要包含句子片段
+- 不要包含任何解释
 
 查询：{query}"""
 
@@ -164,8 +268,8 @@ class KnowledgeExtractionService:
                         {"role": "user", "content": prompt}
                     ],
                     temperature=0.1,
-                    max_tokens=500,
-                    timeout=30
+                    max_tokens=2048,
+                    timeout=60
                 )
                 return response.choices[0].message.content or ""
 
@@ -205,8 +309,8 @@ class KnowledgeExtractionService:
         if not triplets:
             return
 
-        doc_id = metadata.get("document_id") if metadata else None
-        chunk_id = metadata.get("chunk_id") if metadata else None
+        doc_id = (metadata.get("document_id") or metadata.get("source_doc")) if metadata else None
+        chunk_id = (metadata.get("chunk_id") or metadata.get("source_chunk")) if metadata else None
 
         # ===== 后处理 1：规范化三元组 + 异常过滤 =====
         cleaned_triplets = []
@@ -305,6 +409,7 @@ class KnowledgeExtractionService:
             f"图谱构建完成: 抽取 {stats['total']} → 合法 {len(cleaned_triplets)} → 写入 {write_count} "
             f"(规范化 {stats['normalized']}, 非法丢弃 {stats['invalid_name']}, 实体对齐 {aligned_count})"
         )
+        return cleaned_triplets if write_count > 0 else []
 
     async def _fetch_existing_entities(self, triplets: List[Dict[str, Any]]) -> List[str]:
         """查询 Neo4j 中已有的实体名（用于实体对齐）

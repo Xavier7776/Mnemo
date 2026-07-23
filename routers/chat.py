@@ -769,7 +769,8 @@ async def chat(
         agent = GeneralAssistantAgent(model_name=model_name)
         
         # 获取对话历史（如果提供了conversation_id）
-        # Recall Memory：用 summary + 最近 KEEP_RECENT 条原文，告别硬截断
+        # Recall Memory v6：用 compressed_summary（9 段式）+ 最近 KEEP_RECENT 条原文
+        # 不再裁剪 MongoDB messages 数组，保留全部原始消息
         conversation_history = None
         if chat_request.conversation_id:
             try:
@@ -777,14 +778,26 @@ async def chat(
                 doc = await collection.find_one({"_id": chat_request.conversation_id})
                 if doc:
                     messages = doc.get("messages", [])
-                    summary = doc.get("summary", "")
+                    # v6: 优先使用 compressed_summary（9 段式），兼容旧 summary 字段
+                    compressed_summary = doc.get("compressed_summary", "")
+                    summary = compressed_summary or doc.get("summary", "")
                     keep_recent = 8  # 与 memory_summarizer.KEEP_RECENT 保持一致
                     recent = messages[-keep_recent:]
                     # 若有摘要，前置注入为 system 消息，让模型知道更早聊过什么
+                    # v6: compressed_summary 已是 9 段式结构化内容，直接注入
                     conversation_history = (
-                        ([{"role": "system", "content": f"【更早对话摘要】{summary}"}] if summary else [])
+                        ([{"role": "system", "content": f"【更早对话压缩摘要】\n{summary}"}] if summary else [])
                         + [{"role": m.get("role"), "content": m.get("content")} for m in recent]
                     )
+                    # v6.1: 记录最近使用的模型名，供 maybe_summarize 推断 context_window
+                    if model_name:
+                        try:
+                            await collection.update_one(
+                                {"_id": chat_request.conversation_id},
+                                {"$set": {"last_model_name": model_name}}
+                            )
+                        except Exception as e:
+                            logger.debug(f"记录 last_model_name 失败（非关键路径）: {e}")
             except Exception as e:
                 logger.warning(f"获取对话历史失败: {e}")
         

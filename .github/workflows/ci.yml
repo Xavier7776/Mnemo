@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  unit-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest>=8.0.0 pytest-asyncio>=0.23.0
+          # 只安装单元测试所需的最小依赖（避免安装 sentence-transformers 等重依赖）
+          pip install pydantic>=2.0.0 python-dotenv>=1.0.0 jieba>=0.42.1
+
+      - name: Run unit tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          # 单元测试不需要真实外部服务
+          RUN_INTEGRATION_TESTS: ""
+          RUN_LLM_TESTS: ""
+        run: |
+          python -m pytest tests/ -v --tb=short -m "unit or (not integration and not llm and not slow)" --color=yes
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            tests/
+            **/.pytest_cache/
+          retention-days: 7

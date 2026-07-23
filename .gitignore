@@ -27,6 +27,9 @@ wheels/
 MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
+data/
+docs/
+Mnemo.zip
 
 # 虚拟环境
 .env/
@@ -36,7 +39,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-
+.workbuddy/
+.qoder/
 # mypy / pyright 类型检查
 .mypy_cache/
 .dmypy.json

@@ -597,14 +597,25 @@ def process_document_background(
         doc_repo.update_document_progress(doc_id, 35, "向量化", f"共 {len(chunks)} 个文本块")
         
         # 3. 向量化（分批处理，避免内存问题）
-        chunk_texts = [chunk["text"] for chunk in chunks]
-        
+        # 父子分块时只对 child 向量化，parent 不向量化（只存 MongoDB 供回查）
+        is_parent_child = any(
+            (c.get("metadata") or {}).get("chunk_level") == "child"
+            for c in chunks if isinstance(c, dict)
+        )
+        if is_parent_child:
+            child_chunks = [c for c in chunks if (c.get("metadata") or {}).get("chunk_level") == "child"]
+            parent_chunks = [c for c in chunks if (c.get("metadata") or {}).get("chunk_level") == "parent"]
+            chunk_texts = [c["text"] for c in child_chunks]
+            logger.info(f"父子分块模式 - 文档ID: {doc_id}, child: {len(child_chunks)} (向量化), parent: {len(parent_chunks)} (仅存MongoDB)")
+        else:
+            chunk_texts = [chunk["text"] for chunk in chunks]
+
         if not chunk_texts:
             logger.warning(f"文档分块为空 - 文档ID: {doc_id}")
             doc_repo.update_document_status(doc_id, "completed")
             doc_repo.update_document_progress(doc_id, 100, "完成", "文档为空，无需处理")
             return
-        
+
         # 分批向量化（batch_size 可由运行时配置覆盖）
         try:
             from services.runtime_config import get_runtime_config_sync
@@ -616,13 +627,13 @@ def process_document_background(
         batch_size = max(1, batch_size)
         vectors = []
         total_batches = math.ceil(len(chunk_texts) / batch_size)
-        
+
         for i in range(0, len(chunk_texts), batch_size):
             batch = chunk_texts[i:i + batch_size]
             try:
                 batch_vectors = embedding_service.encode(batch)
                 vectors.extend(batch_vectors)
-                
+
                 # 阶段4 (35-75%): 向量化过程中更新进度
                 # 计算: 35 + (已处理批次 / 总批次) * 40
                 current_batch = (i // batch_size) + 1
@@ -633,12 +644,12 @@ def process_document_background(
                     "向量化",
                     f"批次 {current_batch}/{total_batches} ({min(i + batch_size, len(chunk_texts))}/{len(chunk_texts)} 个块)"
                 )
-                
+
                 logger.info(f"向量化进度 - 文档ID: {doc_id}, {min(i + batch_size, len(chunk_texts))}/{len(chunk_texts)}")
             except Exception as e:
                 logger.error(f"向量化失败 - 文档ID: {doc_id}, 批次 {i//batch_size + 1}, 错误: {str(e)}")
                 raise
-        
+
         logger.info(f"文档向量化完成 - 文档ID: {doc_id}, 向量数量: {len(vectors)}")
         
         # 阶段5 (75%): 向量化完成，开始存储
@@ -724,57 +735,115 @@ def process_document_background(
         # 5. 存储到MongoDB和Qdrant（批量处理）
         chunk_ids = []
         total_chunks = len(chunks)
-        
-        # 先批量存储到MongoDB
+
+        # 先批量存储到MongoDB（parent 和 child 都存）
+        # 父子分块时需要建立 parent_id 映射，供检索时 child→parent 回查
+        parent_id_map = {}  # {parent_global_index: chunk_id}
         for idx, chunk in enumerate(chunks):
             try:
+                meta = (chunk.get("metadata") or {}).copy()
+                # 父子分块：记录 parent 的 chunk_id 到 child 的 metadata
+                if is_parent_child:
+                    chunk_level = meta.get("chunk_level")
+                    if chunk_level == "parent":
+                        # parent chunk：先创建，拿到 chunk_id 后记入 map
+                        pass
+                    elif chunk_level == "child":
+                        parent_idx = meta.get("parent_index")
+                        if parent_idx is not None and parent_idx in parent_id_map:
+                            meta["parent_chunk_id"] = parent_id_map[parent_idx]
+
                 chunk_id = get_chunk_repo().create_chunk(
                     document_id=doc_id,
                     chunk_index=idx,
                     text=chunk["text"],
-                    metadata=chunk.get("metadata", {})
+                    metadata=meta
                 )
                 chunk_ids.append(chunk_id)
+                # 记录 parent chunk_id 供后续 child 使用
+                if is_parent_child and meta.get("chunk_level") == "parent":
+                    parent_id_map[idx] = chunk_id
+                # 同步更新 child 的 metadata.parent_chunk_id（如果上面创建时还没拿到）
+                # 注意：由于 child 在 parent 之前入库（见 ParentChildChunker.chunk 的顺序），
+                # parent_id_map 在 child 创建时可能还没有 parent 的 chunk_id。
+                # 所以这里需要第二轮：parent 全部入库后，回头更新 child 的 parent_chunk_id。
             except Exception as e:
                 logger.error(f"存储块到 MongoDB 失败 (chunk {idx}): {e}")
-                # 生成一个临时ID，确保后续处理不会出错
                 chunk_ids.append(f"temp_{doc_id}_{idx}")
-        
+
+        # 父子分块：第二轮更新 child 的 parent_chunk_id
+        # （ParentChildChunker 的输出顺序是 [child0, child1, ..., parent0, child2, child3, ..., parent1, ...]，
+        #   child 在 parent 之前入库，所以第一轮 child 拿不到 parent_chunk_id，需要二轮更新）
+        if is_parent_child and parent_id_map:
+            try:
+                for idx, chunk in enumerate(chunks):
+                    meta = chunk.get("metadata") or {}
+                    if meta.get("chunk_level") != "child":
+                        continue
+                    parent_idx = meta.get("parent_index")
+                    if parent_idx is None or parent_idx not in parent_id_map:
+                        continue
+                    parent_chunk_id = parent_id_map[parent_idx]
+                    cid = chunk_ids[idx]
+                    if cid.startswith("temp_"):
+                        continue
+                    # 更新 MongoDB 中 child chunk 的 metadata.parent_chunk_id
+                    try:
+                        get_chunk_repo().update_chunk_metadata(cid, {"parent_chunk_id": parent_chunk_id})
+                    except Exception as e:
+                        logger.warning(f"更新 child parent_chunk_id 失败 (chunk {cid}): {e}")
+            except Exception as e:
+                logger.warning(f"父子分块 metadata 二轮更新失败（不影响主流程）: {e}")
+
+        # 父子分块：只把 child chunk 存入 Qdrant（parent 不向量化）
+        if is_parent_child:
+            qdrant_chunks = [
+                (i, c) for i, c in enumerate(chunks)
+                if (c.get("metadata") or {}).get("chunk_level") == "child"
+            ]
+            qdrant_chunk_ids = [chunk_ids[i] for i, _ in qdrant_chunks]
+            qdrant_chunk_meta = [(i, c) for i, c in qdrant_chunks]
+        else:
+            qdrant_chunk_ids = chunk_ids
+            qdrant_chunk_meta = list(enumerate(chunks))
+
         # 批量存储向量到Qdrant（如果服务可用）
         qdrant_success_count = 0
         qdrant_failed_count = 0
-        
+
         if qdrant_available:
             qdrant_batch_size = 50
-            
-            for batch_start in range(0, len(vectors), qdrant_batch_size):
-                batch_end = min(batch_start + qdrant_batch_size, len(vectors))
-                batch_vectors = vectors[batch_start:batch_end]
-                batch_chunk_ids = chunk_ids[batch_start:batch_end]
-                batch_chunks = chunks[batch_start:batch_end]
-                
+
+            # 父子分块时 vectors 只对应 child，需要按 child 顺序取
+            if is_parent_child:
+                qdrant_vectors = vectors  # 已经只有 child 的向量
+            else:
+                qdrant_vectors = vectors
+
+            for batch_start in range(0, len(qdrant_vectors), qdrant_batch_size):
+                batch_end = min(batch_start + qdrant_batch_size, len(qdrant_vectors))
+                batch_vectors = qdrant_vectors[batch_start:batch_end]
+                batch_chunk_ids = qdrant_chunk_ids[batch_start:batch_end]
+                batch_chunk_meta = qdrant_chunk_meta[batch_start:batch_end]
+
                 # 构建批量payload
                 batch_payloads = []
                 batch_ids = []
-                for i, (chunk_id, chunk) in enumerate(zip(batch_chunk_ids, batch_chunks)):
+                for i, (chunk_id, (orig_idx, chunk)) in enumerate(zip(batch_chunk_ids, batch_chunk_meta)):
                     if chunk_id.startswith("temp_"):
-                        # 跳过临时ID（MongoDB存储失败的块）
                         continue
                     meta = (chunk.get("metadata") or {}).copy()
-                    # 仅保留对检索/拼接有价值且体积可控的字段
-                    # section_path 可能较长，这里限制单个元素长度，避免 payload 过大
                     section_path = meta.get("section_path")
                     if isinstance(section_path, list):
                         section_path = [str(s)[:200] for s in section_path[:12]]
                     elif section_path is not None:
                         section_path = [str(section_path)[:200]]
 
-                    batch_payloads.append({
+                    payload = {
                         "chunk_id": chunk_id,
                         "document_id": doc_id,
                         "text": chunk["text"],
-                        "chunk_index": batch_start + i,
-                        # 用于邻居扩展与上下文去重的关键元数据
+                        "chunk_index": orig_idx,
                         "metadata": {
                             "content_type": meta.get("content_type", "text"),
                             "chunker_type": meta.get("chunker_type"),
@@ -782,13 +851,17 @@ def process_document_background(
                             "section_path": section_path,
                             "file_type": meta.get("file_type"),
                         }
-                    })
+                    }
+                    # 父子分块：payload 新增 parent_chunk_id，供检索时回查 parent
+                    if is_parent_child:
+                        payload["metadata"]["chunk_level"] = meta.get("chunk_level", "child")
+                        payload["metadata"]["parent_index"] = meta.get("parent_index")
+                        payload["parent_chunk_id"] = parent_id_map.get(meta.get("parent_index"), "")
+                    batch_payloads.append(payload)
                     batch_ids.append(chunk_id)
-                
-                # 只处理有效的向量
+
                 if batch_payloads:
                     try:
-                        # 获取对应的向量（只处理MongoDB存储成功的块）
                         valid_vectors = []
                         valid_payloads = []
                         valid_ids = []
@@ -799,7 +872,7 @@ def process_document_background(
                                 valid_payloads.append(batch_payloads[payload_idx])
                                 valid_ids.append(chunk_id)
                                 payload_idx += 1
-                        
+
                         if valid_vectors:
                             qdrant_client_instance.insert_vectors(
                                 vectors=valid_vectors,
@@ -813,16 +886,15 @@ def process_document_background(
                     except Exception as e:
                         qdrant_failed_count += len(batch_payloads)
                         logger.warning(f"批量存储向量到 Qdrant 失败 - 批次 {batch_start//qdrant_batch_size + 1}: {e}")
-                        # 如果连续失败，检查服务是否仍然可用
                         if qdrant_failed_count > 10:
                             if not qdrant_client.check_health():
                                 logger.error(f"Qdrant 服务不可用，停止尝试存储向量 - 文档ID: {doc_id}")
                                 qdrant_available = False
                                 break
-                
+
                 # 阶段5 (75-95%): 存储过程中更新进度
-                progress = 75 + int((batch_end / total_chunks) * 20)
-                status_msg = f"已存储 {batch_end}/{total_chunks} 个块"
+                progress = 75 + int((batch_end / max(1, total_chunks)) * 20)
+                status_msg = f"已存储 {batch_end}/{len(qdrant_vectors)} 个向量"
                 if qdrant_available:
                     status_msg += f" (Qdrant: {qdrant_success_count} 成功, {qdrant_failed_count} 失败)"
                 else:

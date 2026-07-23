@@ -84,7 +84,7 @@ class SimpleChunker(BaseChunker):
             
             # 提取块文本
             chunk_text = text[current_pos:end_pos].strip()
-            
+
             if chunk_text:
                 chunks.append({
                     "text": chunk_text,
@@ -92,16 +92,20 @@ class SimpleChunker(BaseChunker):
                     "end_index": end_pos,
                     "metadata": metadata or {}
                 })
-            
+
+            # 当前 chunk 已覆盖到文本末尾，无需继续（避免末尾生成大量微小重叠 chunk）
+            if end_pos >= text_len:
+                break
+
             # 移动到下一个块的开始位置（考虑重叠）
             # 确保至少向前移动，避免死循环
             next_pos = end_pos - self.chunk_overlap
             if next_pos <= current_pos:
                 # 如果没有向前移动，强制移动至少一个字符
                 next_pos = current_pos + 1
-            
+
             current_pos = next_pos
-            
+
             # 如果已经到达文本末尾，退出
             if current_pos >= text_len:
                 break

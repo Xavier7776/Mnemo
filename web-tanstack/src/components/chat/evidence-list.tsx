@@ -6,8 +6,14 @@
  * - verified 标记（绿色 ✓ / 红色 ✗）
  * - retrieved_at_round 标签（第几轮检索获取）
  * - relevance_score 进度条
+ *
+ * 过滤规则与后端 rag_retriever.py 的 RRF 融合后过滤一致：
+ * - 按 score 降序排序
+ * - 剔除 score < max_score * RRF_FILTER_RATIO（默认 0.1）的低分噪声
+ * - 兜底至少保留 top1（避免全被过滤掉）
+ * 后端没有使用的（低于阈值的）前端不展示。
  */
-import { memo, useState } from "react"
+import { memo, useMemo, useState } from "react"
 import { CheckCircle2, XCircle, ChevronDown, ChevronRight, FileText } from "lucide-react"
 
 import type { RetrievalEvidence } from "@/types/api"
@@ -16,6 +22,27 @@ import { cn } from "@/lib/utils"
 interface EvidenceListProps {
   evidence: RetrievalEvidence[]
   defaultExpanded?: boolean
+}
+
+// 与后端 rag_retriever.py 的 RRF_FILTER_RATIO 保持一致
+const RRF_FILTER_RATIO = 0.1
+
+/**
+ * 按后端规则过滤 evidence：
+ * 1. 按 score 降序排序
+ * 2. 剔除 score < max_score * RRF_FILTER_RATIO 的低分噪声
+ * 3. 兜底至少保留 top1
+ */
+function filterEvidenceByScore(evidence: RetrievalEvidence[]): RetrievalEvidence[] {
+  if (!evidence || evidence.length === 0) return []
+  const withScore = evidence
+    .map((e) => ({ e, s: Number(e.relevance_score ?? e.score ?? 0) }))
+    .sort((a, b) => b.s - a.s)
+  const maxScore = withScore[0].s
+  if (maxScore <= 0) return withScore.map((x) => x.e)
+  const threshold = maxScore * RRF_FILTER_RATIO
+  const filtered = withScore.filter((x) => x.s >= threshold).map((x) => x.e)
+  return filtered.length > 0 ? filtered : withScore.slice(0, 1).map((x) => x.e)
 }
 
 const EvidenceCard = memo(function EvidenceCard({ item, index }: { item: RetrievalEvidence; index: number }) {
@@ -95,20 +122,23 @@ export const EvidenceList = memo(function EvidenceList({
   evidence,
   defaultExpanded = false,
 }: EvidenceListProps) {
-  if (!evidence || evidence.length === 0) {
+  // 按后端规则过滤 evidence（与 rag_retriever.py 的 RRF_FILTER_RATIO 一致）
+  const filteredEvidence = useMemo(() => filterEvidenceByScore(evidence), [evidence])
+
+  if (!filteredEvidence || filteredEvidence.length === 0) {
     return null
   }
 
-  const verifiedCount = evidence.filter((e) => e.verified === true).length
+  const verifiedCount = filteredEvidence.filter((e) => e.verified === true).length
   const [showAll, setShowAll] = useState(defaultExpanded)
-  const displayed = showAll ? evidence : evidence.slice(0, 3)
-  const hiddenCount = evidence.length - displayed.length
+  const displayed = showAll ? filteredEvidence : filteredEvidence.slice(0, 3)
+  const hiddenCount = filteredEvidence.length - displayed.length
 
   return (
     <div className="mt-3 space-y-2 border-t border-[var(--blue-line)] pt-3">
       <div className="flex items-center justify-between">
         <div className="text-[11px] uppercase tracking-[0.18em] text-slate-500">
-          Evidence · {evidence.length}
+          Evidence · {filteredEvidence.length}
         </div>
         {verifiedCount > 0 ? (
           <div className="text-[10px] text-emerald-600">
@@ -129,7 +159,7 @@ export const EvidenceList = memo(function EvidenceList({
         >
           展开剩余 {hiddenCount} 条证据
         </button>
-      ) : showAll && evidence.length > 3 ? (
+      ) : showAll && filteredEvidence.length > 3 ? (
         <button
           type="button"
           className="w-full rounded-lg border border-dashed border-neutral-200 py-1.5 text-[11px] text-neutral-500 hover:bg-neutral-50"

@@ -213,7 +213,7 @@ class LLMService:
                 f"【检索知识】\n{context}"
             )
 
-        # MCP compact 模式：注入工具摘要，告知 LLM 已按需加载相关工具
+        # MCP compact 模式：工具数 > 阈值时注入工具摘要，告知 LLM 已按需加载相关工具
         try:
             from services.mcp_client_service import mcp_client_manager
             if mcp_client_manager.is_enabled and mcp_client_manager.should_use_compact_mode(self.model_name):
@@ -221,7 +221,7 @@ class LLMService:
                 if compact_summary:
                     system_parts.append(
                         f"\n【MCP 工具说明（按需加载模式）】\n"
-                        f"当前 MCP 工具数量较多，已启用按需加载模式。\n\n"
+                        f"当前 MCP 工具数量较多（> 100），已启用按需加载模式。\n\n"
                         f"## 工作方式\n"
                         f"- 系统**已根据用户问题自动检索**最相关的 MCP 工具，并注入了它们的完整 schema。\n"
                         f"- 你**直接调用**已注入的 mcp__{{server}}__{{tool}} 工具即可，**无需先调 mcp_list_tools**。\n"
@@ -231,11 +231,6 @@ class LLMService:
                         f"2. 如果有：直接调用（按 schema 传参）。\n"
                         f"3. 如果没有但你确信存在该 MCP 工具：调 mcp_list_tools(server_name) 查询，拿到工具名后调用。\n"
                         f"4. 如果不需要 MCP 工具（纯对话/知识问答）：直接回答，不要调任何 MCP 工具。\n\n"
-                        f"## 判断示例\n"
-                        f"- 用户问"读取 D:/test.txt" 且 tools 中有 mcp__filesystem__read_file → 直接调用\n"
-                        f"- 用户问"读取 D:/test.txt" 但 tools 中没有 filesystem 工具 → 调 mcp_list_tools(filesystem)\n"
-                        f"- 用户问"你好" → 不需要 MCP 工具 → 直接回答\n"
-                        f"- 用户问"什么是 RAG" → 不需要 MCP 工具（用内置知识或 rag_retrieve）→ 直接回答\n\n"
                         f"## 全部 MCP 工具摘要（供你判断是否需要调 mcp_list_tools）\n"
                         f"{compact_summary}"
                     )
@@ -327,8 +322,7 @@ class LLMService:
 
         adapter = self._adapter
 
-        # v3 按需加载：compact mode 时按 user query 动态筛选 MCP 工具 schema
-        # 避免把所有 MCP 工具 schema 都塞进 prompt，节省 token + 提升决策准确率
+        # v6 阈值模式：工具数 > 100 时走 compact 模式（按需加载），否则全量注入
         from services.mcp_client_service import mcp_client_manager
         use_compact_mode = (
             mcp_client_manager.is_enabled
@@ -336,13 +330,14 @@ class LLMService:
         )
 
         if use_compact_mode:
-            # 从 messages 中提取 user query（最后一个 user 消息）
+            # compact 模式：按 user query 检索相关 MCP 工具，注入 top_k 个 schema
+            # 流程：用户问题 → ToolIndex 检索 → top_k 个工具 schema → 注入 tools_payload
             user_query = ""
             for msg in reversed(messages):
                 if msg.get("role") == "user":
                     user_query = (msg.get("content") or "").strip()
                     break
-            # 按需加载：内置工具 + query 相关的 MCP 工具 + mcp_list_tools 兜底
+
             dynamic_schemas = ai_tools.get_dynamic_tools_schema(
                 query=user_query,
                 top_k=5,
@@ -351,7 +346,7 @@ class LLMService:
             canonical_tools = ToolSchemaConverter.from_ai_tools_schema(dynamic_schemas)
             tools_payload = adapter.convert_tools(canonical_tools)
             logger.info(
-                f"v3 按需加载启用: query={user_query[:50]!r}, "
+                f"v6 compact 模式按需加载: query={user_query[:50]!r}, "
                 f"tools_payload 数量={len(tools_payload)}"
             )
         else:
@@ -543,6 +538,28 @@ class LLMService:
                 ],
             }
             yield "\x1eTOOL_CALL:" + json.dumps(tool_call_event, ensure_ascii=False) + "\x1e"
+
+            # v6 工具结果落盘：大的结果存磁盘，messages 里只放引用（节省 token）
+            # SSE 事件已发送完整结果给前端，这里只替换注入到 current_messages 的内容
+            try:
+                from services.tool_result_store import tool_result_store
+                for i, tr in enumerate(tool_results):
+                    if tool_result_store.should_store(tr["result"]):
+                        file_path = tool_result_store.store(
+                            tool_name=tr["tool"],
+                            arguments=tr.get("params") or {},
+                            result=tr["result"],
+                        )
+                        if file_path:
+                            # 替换 tool_results 中的结果为引用文本（用于 results_text 拼接）
+                            ref_text = tool_result_store.make_reference(tr["tool"], tr["result"], file_path)
+                            tool_results[i]["result"] = ref_text
+                            # 替换 canonical_results 中的 content（用于 tool_result_messages 构造）
+                            if i < len(canonical_results):
+                                canonical_results[i].content = ref_text
+                            logger.debug(f"工具结果已落盘替换: tool={tr['tool']}, file={os.path.basename(file_path)}")
+            except Exception as e:
+                logger.warning(f"工具结果落盘处理失败（非关键路径，使用原始结果）: {e}")
 
             # —— 阶段三：Observe（观察）+ Reflect（反思）——
             # 对 rag_retrieve 工具结果做证据验证和反思，决定是否继续检索

@@ -363,7 +363,9 @@ class Reflector:
         self._min_top_score = float(os.getenv("REFLECTOR_MIN_TOP_SCORE", "0.3"))
         # 增强规则参数
         self._min_score_gap = float(os.getenv("REFLECTOR_MIN_SCORE_GAP", "0.1"))  # top1-top3 分数差距低于此值说明区分度差
-        self._min_coverage = float(os.getenv("REFLECTOR_MIN_COVERAGE", "0.5"))    # 验证后 chunk 覆盖 query 关键词的最低比例
+        # 默认值 0.3 来自网格搜索调参（500 样本 × 96 组合）：F1 0.7304 → 0.8130
+        # 详见 tests/threshold_tuning_results.md
+        self._min_coverage = float(os.getenv("REFLECTOR_MIN_COVERAGE", "0.3"))    # 验证后 chunk 覆盖 query 关键词的最低比例
         self._stagnant_rounds = int(os.getenv("REFLECTOR_STAGNANT_ROUNDS", "2"))  # verified_count 连续 N 轮不增长则判定策略无效
 
     @property

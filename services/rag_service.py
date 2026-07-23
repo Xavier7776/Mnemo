@@ -48,17 +48,25 @@ class RAGService:
         from database.mongodb import mongodb
         trace: Dict[str, Any] = {"query": query, "started_at": int(time.time() * 1000)}
         # 运行时开关：决定是否启用图谱检索/重排等高耗模块
+        # 优先级：环境变量 ENABLE_RERANKER > MongoDB runtime_config > 默认 False
+        # 避免数据库未连接时兜底为 True 导致意外加载 reranker 模型
+        import os as _os
+        _env_reranker = _os.getenv("ENABLE_RERANKER", "0").strip().lower() in {"1", "true", "yes", "on"}
         try:
             from services.runtime_config import get_runtime_config
 
             runtime_cfg = await get_runtime_config()
             modules = runtime_cfg.get("modules") or {}
             params = runtime_cfg.get("params") or {}
-            rerank_enabled = bool(modules.get("rerank_enabled", True))
+            # MongoDB 中显式配置了 rerank_enabled 时才覆盖环境变量
+            if "rerank_enabled" in modules:
+                rerank_enabled = bool(modules.get("rerank_enabled"))
+            else:
+                rerank_enabled = _env_reranker
         except Exception:
             modules = {}
             params = {}
-            rerank_enabled = True
+            rerank_enabled = _env_reranker
         # query_planner（阶段二：LLM 驱动 + 规则 fallback）
         # 如果调用方已传入 plan（如对话路径前置规划），直接复用，避免重复调用 LLM
         if plan is not None:
@@ -260,6 +268,30 @@ class RAGService:
                 else:
                     neighbor_prefetch_map[cid] = nb_result
 
+        # —— 父子分块（small-to-big）：命中 child 时回查 parent 文本 ——
+        # parent 大块含完整上下文，用 parent 文本替代 child 文本返回给 LLM
+        # 命中 child 后不再做邻居扩展（parent 已覆盖完整上下文）
+        parent_prefetch_map: Dict[str, Optional[Dict[str, Any]]] = {}  # {parent_chunk_id: parent_chunk_doc}
+        parent_prefetch_keys = set()
+        for result in results:
+            payload = result.get("payload") or {}
+            chunk_level = (payload.get("metadata") or {}).get("chunk_level")
+            parent_chunk_id = payload.get("parent_chunk_id")
+            # child chunk 且携带 parent_chunk_id 时才回查
+            if chunk_level == "child" and parent_chunk_id:
+                parent_prefetch_keys.add(parent_chunk_id)
+
+        if parent_prefetch_keys:
+            def _get_parent(pid: str):
+                return chunk_repo.get_chunk_by_id(pid)
+            parent_tasks = [asyncio.to_thread(_get_parent, pid) for pid in parent_prefetch_keys]
+            parent_results_list = await asyncio.gather(*parent_tasks, return_exceptions=True)
+            for pid, pres in zip(parent_prefetch_keys, parent_results_list):
+                if isinstance(pres, Exception) or pres is None:
+                    parent_prefetch_map[pid] = None
+                else:
+                    parent_prefetch_map[pid] = pres
+
         for result in results:
             text = result["payload"].get("text", "")
             if text:
@@ -270,6 +302,19 @@ class RAGService:
                 file_id = result["payload"].get("file_id")
                 conversation_id = result["payload"].get("conversation_id")
                 score = result.get("score", 0) or result.get("combined_score", 0)
+
+                # 父子分块（small-to-big）：命中 child 时用 parent 文本替代 child 文本
+                # parent 大块含完整上下文，child 仅用于精准命中
+                is_child_chunk = metadata.get("chunk_level") == "child"
+                parent_chunk_id = result["payload"].get("parent_chunk_id")
+                parent_doc = parent_prefetch_map.get(parent_chunk_id) if (is_child_chunk and parent_chunk_id) else None
+                if parent_doc and parent_doc.get("text"):
+                    text = parent_doc["text"]
+                    # 合并 parent 的 section_path（更完整）
+                    parent_meta = parent_doc.get("metadata") or {}
+                    if isinstance(parent_meta.get("section_path"), list):
+                        metadata = {**metadata, "section_path": parent_meta["section_path"]}
+
                 doc_info = document_info_map.get(doc_id, {}) if doc_id else {}
                 document_title = (
                     result["payload"].get("filename")
@@ -304,7 +349,8 @@ class RAGService:
                 ))
 
                 # 邻居扩展（仅对普通文档 chunk 生效，结果已在上方并发预取）
-                if chunk_id and doc_id is not None and chunk_index is not None and isinstance(chunk_index, int):
+                # 父子分块命中的 child 已用 parent 文本替代，不再做邻居扩展（避免上下文重复）
+                if (not is_child_chunk) and chunk_id and doc_id is not None and chunk_index is not None and isinstance(chunk_index, int):
                     if chunk_id not in seen_chunk_ids:
                         seen_chunk_ids.add(chunk_id)
                         neighbors = neighbor_prefetch_map.get(chunk_id) or []

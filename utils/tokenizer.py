@@ -50,6 +50,31 @@ STOPWORDS = {
     "时", "中", "上", "下", "里", "外", "前", "后",
     # 单字噪声
     "用", "由", "从", "向", "到", "于", "以", "可", "可以",
+
+    # === 英文停用词（高频虚词，IDF 极低，稀释关键词权重） ===
+    # 冠词
+    "a", "an", "the",
+    # be 动词变形
+    "is", "am", "are", "was", "were", "be", "been", "being",
+    # 助动词
+    "do", "does", "did", "doing", "have", "has", "had", "having",
+    "will", "would", "shall", "should", "can", "could", "may", "might", "must",
+    # 介词
+    "of", "in", "on", "at", "to", "for", "with", "by", "from", "as", "into",
+    "onto", "upon", "about", "above", "below", "between", "through", "during",
+    "before", "after", "over", "under", "again", "further", "than",
+    # 连词
+    "and", "or", "but", "if", "then", "else", "when", "where", "why", "how",
+    "all", "both", "each", "few", "more", "most", "other", "some", "such",
+    "no", "nor", "not", "only", "own", "same", "so", "too", "very",
+    # 代词
+    "i", "me", "my", "myself", "we", "us", "our", "ours", "ourselves",
+    "you", "your", "yours", "yourself", "yourselves",
+    "he", "him", "his", "himself", "she", "her", "hers", "herself",
+    "it", "its", "itself", "they", "them", "their", "theirs", "themselves",
+    "what", "which", "who", "whom", "this", "that", "these", "those",
+    # 常见弱意义词
+    "there", "here", "out", "up", "down", "off", "away",
 }
 
 # 驼峰切分正则（保留原始大小写时使用）

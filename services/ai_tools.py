@@ -278,11 +278,11 @@ class AITools:
         top_k: int = 5,
         include_mcp_list_tools: bool = True,
     ) -> List[Dict[str, Any]]:
-        """v3 按需加载：返回内置工具 + 与 query 相关的 MCP 工具 schema
+        """v6 compact 模式按需加载：返回内置工具 + 与 query 相关的 MCP 工具 schema
 
-        compact mode 下替代 get_tools_schema()，避免把所有 MCP 工具 schema 都塞进 prompt。
+        compact 模式下替代 get_tools_schema()，避免把所有 MCP 工具 schema 都塞进 prompt。
         流程：
-            1. 取所有内置工具 schema（self.tools 中非 mcp__ 前缀的）
+            1. 取所有内置工具 schema（self.tools 中非 mcp__ 前缀的，包括 mcp_list_tools）
             2. 调 mcp_client_manager.get_relevant_tool_schemas(query, top_k) 取相关 MCP 工具
             3. 可选加上 mcp_list_tools 元工具（兜底，让 LLM 能查询其他工具）
 
@@ -305,7 +305,7 @@ class AITools:
         # 2. 按 query 检索相关 MCP 工具
         try:
             from services.mcp_client_service import mcp_client_manager
-            if mcp_client_manager.is_enabled:
+            if mcp_client_manager.is_enabled and query and query.strip():
                 relevant_mcp_tools = mcp_client_manager.get_relevant_tool_schemas(query, top_k=top_k)
                 schemas.extend(relevant_mcp_tools)
         except Exception as e:
@@ -317,18 +317,26 @@ class AITools:
             if list_tools_schema:
                 schemas.append(list_tools_schema)
 
+        mcp_count = len([s for s in schemas if s.get("name", "").startswith("mcp__")])
+        builtin_count = len(schemas) - mcp_count
         logger.info(
-            f"get_dynamic_tools_schema: query={query!r}, "
-            f"内置={len([s for s in schemas if not s.get('name', '').startswith('mcp__') and s.get('name') != 'mcp_list_tools'])}, "
-            f"MCP相关={len([s for s in schemas if s.get('name', '').startswith('mcp__')])}, "
-            f"总计={len(schemas)}"
+            f"get_dynamic_tools_schema: query={query[:50]!r}, "
+            f"内置={builtin_count}, MCP相关={mcp_count}, 总计={len(schemas)}"
         )
         return schemas
     
     def _filter_tool_arguments(self, name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        """只保留该工具 schema 中声明的参数，忽略模型误传的占位符（如 参数名、参数值）"""
+        """只保留该工具 schema 中声明的参数，忽略模型误传的占位符（如 参数名、参数值）
+
+        MCP 工具（name 以 mcp__ 开头）不过滤，直接透传参数：
+        - MCP 工具 schema 不在 self.tools 中（按需加载模式），由 MCP Server 自己校验
+        - 避免参数被误清空导致 MCP 工具调用失败
+        """
         if not arguments:
             return {}
+        # MCP 工具直接透传参数（schema 由 MCP Server 校验）
+        if name.startswith("mcp__"):
+            return arguments
         schema = self.tools.get(name, {}).get("parameters", {})
         allowed = schema.get("properties", {})
         if not allowed:
@@ -428,49 +436,44 @@ class AITools:
             logger.error(f"调用工具函数 {name} 失败: {str(e)}", exc_info=True)
             raise
 
-    def register_mcp_tools(self, manager, force_compact: Optional[bool] = None, model_name: Optional[str] = None) -> int:
+    def register_mcp_tools(self, manager, force_compact: Optional[bool] = None) -> int:
         """将 MCP Server 的工具动态注册为 ai_tools
+
+        v6 恢复阈值模式：
+        - 工具数 ≤ TOOL_COUNT_THRESHOLD(100)：全量注册（每个 MCP 工具进 self.tools）
+        - 工具数 > 阈值：compact 模式，只注册 wrapper + mcp_list_tools 元工具
+          LLM 通过 ToolIndex 按需加载相关工具 schema
 
         Args:
             manager: MCPClientManager 实例
             force_compact: 强制指定 compact 模式
-                - True：只注册 mcp_list_tools 元工具（不注册具体 MCP 工具）
-                - False：注册全部 MCP 工具（全量模式）
-                - None：根据 manager.should_use_compact_mode(model_name) 自动判断
-            model_name: LLM 模型名（如 "mimo-v2.5"），用于按 context window 自适应阈值。
-                None 时从环境变量 LLM_MODEL 读取，再不行则用默认阈值 TOOL_COUNT_THRESHOLD。
+                - True：compact 模式（只注册 wrapper + mcp_list_tools 元工具）
+                - False：全量模式（注册所有 MCP 工具到 self.tools）
+                - None：根据 manager.should_use_compact_mode() 自动判断
 
         Returns:
-            注册的工具数量（compact 模式下返回 1，即 mcp_list_tools 元工具）
-
-        compact 模式设计：
-        - v3: 工具数 > 自适应阈值时启用（8K→15, 16K→18, 32K→22, 64K→28, 128K→35, >128K→40）
-        - tools_payload 里不包含具体 MCP 工具 schema，只含 mcp_list_tools 元工具
-        - LLM 通过 mcp_list_tools 查询具体工具后再调用 mcp__{server}__{tool}
-        - 优势：大幅降低 prompt token（10 个工具 vs 100 个工具的 schema 差异巨大）
-        - 代价：LLM 多一次 mcp_list_tools 调用，决策延迟略增
+            注册的工具数量
         """
         if not manager.is_enabled:
             logger.info("MCP 未启用或未初始化，跳过 MCP 工具注册")
             return 0
 
-        # 自动获取 model_name（从环境变量兜底）
-        if model_name is None:
-            model_name = os.getenv("LLM_MODEL")
+        # 清理旧注册的 MCP 工具（热更新场景）
+        self._cleanup_mcp_tools()
 
-        # 判断是否启用 compact 模式（按 model_name 自适应阈值）
-        use_compact = force_compact if force_compact is not None else manager.should_use_compact_mode(model_name)
+        # 判断是否启用 compact 模式
+        use_compact = force_compact if force_compact is not None else manager.should_use_compact_mode()
 
         if use_compact:
-            # compact 模式：只注册 mcp_list_tools 元工具
-            registered = self._register_mcp_list_tools_meta(manager)
+            # compact 模式：只注册 wrapper + mcp_list_tools 元工具
+            registered = self._register_mcp_compact_mode(manager)
             logger.info(
-                f"MCP compact 模式启用（共 {manager.total_tool_count} 个工具 > 阈值，model={model_name or 'default'}），"
-                f"只注册 mcp_list_tools 元工具，LLM 通过它发现具体工具"
+                f"MCP compact 模式启用（共 {manager.total_tool_count} 个工具 > 阈值 {30}），"
+                f"LLM 通过 ToolIndex 按需加载相关工具 schema"
             )
             return registered
 
-        # 全量模式：注册所有 MCP 工具
+        # 全量模式：注册所有 MCP 工具到 self.tools
         tool_map = manager.get_tool_map()
         all_tools = manager.get_all_tools()
         registered = 0
@@ -489,7 +492,6 @@ class AITools:
                 function=wrapper,
             )
             # 注册到 async_tools 字典，确保 async_call_tool 走 await 分支
-            # 触发懒加载，确保 _async_tools 字典已初始化
             self._get_async_tools()
             self._async_tools[tool_name] = wrapper
             registered += 1
@@ -497,18 +499,19 @@ class AITools:
         logger.info(f"MCP 工具注册完成（全量模式）: {registered} 个工具")
         return registered
 
-    def _register_mcp_list_tools_meta(self, manager) -> int:
-        """注册 mcp_list_tools 元工具 + 所有 MCP 工具 wrapper（compact 模式专用）
+    def _register_mcp_compact_mode(self, manager) -> int:
+        """compact 模式注册：所有 wrapper + mcp_list_tools 元工具
 
-        v3 调整：compact mode 现在走"按需加载"路径（ToolIndex 检索相关工具直接注入 schema），
-        此方法仍负责：
-        1. 注册所有 MCP 工具的 wrapper 到 async_tools（不进 tools schema）
-           — 这样 LLM 调用任意检索出来的 MCP 工具时，async_call_tool 仍能找到 wrapper 执行
-        2. 注册 mcp_list_tools 元工具到 tools schema（作为兜底）
-           — 当 ToolIndex 检索结果不准或 LLM 想看完整工具列表时使用
+        v6 设计：
+        1. 所有 MCP 工具的 wrapper 注册到 async_tools + self.functions（保证可执行）
+           但不注册到 self.tools（不进 tools schema，避免 prompt 膨胀）
+        2. 注册 mcp_list_tools 元工具到 self.tools（让 LLM 能主动查询未检索到的工具）
+        3. tools_payload 由 get_dynamic_tools_schema(query) 实时检索注入相关工具 schema
 
-        关键设计：wrapper 全量注册到 async_tools 保证可执行，但 tools schema 只在
-        get_dynamic_tools_schema(query) 时按需取出，避免 prompt 膨胀。
+        关键设计：
+        - wrapper 全量注册保证 LLM 调用任意检索出来的 MCP 工具都能执行
+        - tools schema 按需取出，避免 prompt 膨胀
+        - mcp_list_tools 作为兜底，当 ToolIndex 检索不准时 LLM 可主动查询
         """
         # 1. 注册所有 MCP 工具的 wrapper 到 async_tools（不进 tools schema）
         tool_map = manager.get_tool_map()
@@ -550,6 +553,27 @@ class AITools:
         )
         self._async_tools["mcp_list_tools"] = mcp_list_tools
         return 1
+
+    def _cleanup_mcp_tools(self) -> None:
+        """清理已注册的 MCP 工具 wrapper（热更新时调用）"""
+        # 清理 self.functions
+        mcp_names = [name for name in self.functions if name.startswith("mcp__")]
+        for name in mcp_names:
+            self.functions.pop(name, None)
+
+        # 清理 self.tools（全量模式注册的 MCP 工具 + mcp_list_tools 元工具）
+        mcp_names_in_tools = [name for name in self.tools if name.startswith("mcp__") or name == "mcp_list_tools"]
+        for name in mcp_names_in_tools:
+            self.tools.pop(name, None)
+
+        # 清理 async_tools
+        if self._async_tools:
+            mcp_names_in_async = [
+                name for name in self._async_tools
+                if name.startswith("mcp__") or name == "mcp_list_tools"
+            ]
+            for name in mcp_names_in_async:
+                self._async_tools.pop(name, None)
 
     @staticmethod
     def _make_mcp_tool_wrapper(manager, server_name: str, tool_name: str):

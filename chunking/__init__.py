@@ -4,17 +4,19 @@ from .base import BaseChunker
 from .simple_chunker import SimpleChunker
 from .smart_chunker import SmartChunker
 from .report_chunker import ReportChunker
+from .parent_child_chunker import ParentChildChunker
 
 # 导出分块路由模块
 try:
     from .router import ContentAnalyzer
     from .langchain import RecursiveChunker, SemanticChunker
-    
+
     __all__ = [
         "BaseChunker",
         "SimpleChunker",
         "SmartChunker",
         "ReportChunker",
+        "ParentChildChunker",
         "ContentAnalyzer",
         "RecursiveChunker",
         "SemanticChunker"
@@ -25,6 +27,7 @@ except ImportError:
         "BaseChunker",
         "SimpleChunker",
         "SmartChunker",
-        "ReportChunker"
+        "ReportChunker",
+        "ParentChildChunker"
     ]
 

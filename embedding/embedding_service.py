@@ -22,10 +22,14 @@ class EmbeddingService:
         if self._model is None:
             try:
                 from sentence_transformers import SentenceTransformer
-                logger.info(f"正在加载 embedding 模型: {self.model_name}（首次需下载 ~100MB）")
-                self._model = SentenceTransformer(self.model_name, trust_remote_code=True)
+                # 读取 EMBEDDING_DEVICE 环境变量，默认 cpu
+                # 6GB 显存 GPU 跑 bge-m3（权重 2.3GB + 推理激活）容易 OOM，默认 cpu 更稳
+                # 显存充足时（8GB+）可设 EMBEDDING_DEVICE=cuda 加速
+                device = os.getenv("EMBEDDING_DEVICE", "cpu")
+                logger.info(f"正在加载 embedding 模型: {self.model_name}（device={device}）")
+                self._model = SentenceTransformer(self.model_name, device=device, trust_remote_code=True)
                 self.vector_size = self._model.get_sentence_embedding_dimension()
-                logger.info(f"Embedding 模型加载完成 - 向量维度: {self.vector_size}")
+                logger.info(f"Embedding 模型加载完成 - 向量维度: {self.vector_size}, device={device}")
             except Exception as e:
                 logger.error(f"加载 embedding 模型失败: {str(e)}", exc_info=True)
                 raise

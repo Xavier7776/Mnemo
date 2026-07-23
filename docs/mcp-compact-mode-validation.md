@@ -582,3 +582,332 @@ else:
 | [services/mcp_client_service.py](file:///d:/timeModel/Mnemo/services/mcp_client_service.py) | 修改 | 新增 `build_tool_index` / `get_relevant_tool_schemas`，在 initialize/重连/热加载后调用 |
 | [services/ai_tools.py](file:///d:/timeModel/Mnemo/services/ai_tools.py) | 修改 | 新增 `get_dynamic_tools_schema`，`_register_mcp_list_tools_meta` 改为兜底角色 |
 | [services/llm_service.py](file:///d:/timeModel/Mnemo/services/llm_service.py) | 修改 | `_generate_stream` compact mode 走按需加载，system prompt 改造 |
+
+---
+
+## 十一、v5 纯按需加载（2026-07-20）
+
+### 11.1 问题：v4 仍有阈值判断
+
+v4 虽然实现了按需加载，但仍保留了 compact mode 阈值判断：
+- 工具数 > 阈值时走按需加载
+- 工具数 ≤ 阈值时走全量注入
+- 保留了 mcp_list_tools 元工具作为兜底
+
+这不符合"完全按需加载"的设计目标。用户要求的流程图是：
+
+```
+用户问题
+      │
+      ▼
+Tool Index（embedding 编码工具 name + description）
+      │
+      ▼
+检索最相关的 5 个工具（余弦相似度）
+      │
+      ▼
+加载这些工具的完整 Schema（直接注入 tools_payload）
+      │
+      ▼
+LLM 进行 Tool Calling（无需先调 mcp_list_tools）
+```
+
+### 11.2 v5 改造：完全按流程图实现
+
+**核心变化**：
+1. **抛弃阈值判断**：不再区分 compact/全量模式，所有请求都走按需加载
+2. **移除 mcp_list_tools 元工具**：流程图中没有这一步，LLM 直接 tool calling
+3. **register_mcp_tools 只注册 wrapper**：所有 MCP 工具 wrapper 只注册到 async_tools + self.functions（保证可执行），不注册到 self.tools（不进 tools schema）
+4. **get_dynamic_tools_schema 简化**：只返回内置工具 + query 相关的 MCP 工具，不再加 mcp_list_tools 兜底
+
+### 11.3 实现细节
+
+#### 11.3.1 `register_mcp_tools` 简化（[services/ai_tools.py:431-476](file:///d:/timeModel/Mnemo/services/ai_tools.py)）
+
+```python
+def register_mcp_tools(self, manager) -> int:
+    """v5 纯按需加载模式：只注册 wrapper，不注册到 tools schema"""
+    # 清理旧注册的 MCP 工具（热更新场景）
+    self._cleanup_mcp_tools()
+    # 所有 MCP 工具的 wrapper 只注册到 async_tools + self.functions
+    for tool_schema in all_tools:
+        wrapper = self._make_mcp_tool_wrapper(manager, server_name, original_name)
+        self._async_tools[tool_name] = wrapper  # 保证可执行
+        self.functions[tool_name] = wrapper     # async_call_tool 校验
+        # 不注册到 self.tools，避免 tools schema 膨胀
+```
+
+**关键设计**：
+- wrapper 全量注册到 async_tools：保证 LLM 调用任意检索出来的 MCP 工具时都能执行
+- 不注册到 self.tools：tools schema 由 get_dynamic_tools_schema(query) 实时检索注入
+- 移除了 `_register_mcp_list_tools_meta` 方法和 mcp_list_tools 元工具
+
+#### 11.3.2 `get_dynamic_tools_schema` 简化（[services/ai_tools.py:275-319](file:///d:/timeModel/Mnemo/services/ai_tools.py)）
+
+```python
+def get_dynamic_tools_schema(self, query: str, top_k: int = 5) -> List[Dict]:
+    """v5 纯按需加载：返回内置工具 + 与 query 相关的 MCP 工具 schema"""
+    schemas = []
+    # 1. 内置工具（全部注入，数量少且是核心能力）
+    schemas.extend([s for s in self.tools.values() if not s["name"].startswith("mcp__")])
+    # 2. 按 query 检索相关 MCP 工具（纯按需，不注入全量）
+    if mcp_client_manager.is_enabled and query:
+        schemas.extend(mcp_client_manager.get_relevant_tool_schemas(query, top_k=top_k))
+    # 不再注入 mcp_list_tools 元工具
+    return schemas
+```
+
+#### 11.3.3 `_filter_tool_arguments` 适配（[services/ai_tools.py:328-344](file:///d:/timeModel/Mnemo/services/ai_tools.py)）
+
+MCP 工具 schema 不在 self.tools 中，参数过滤会清空 MCP 工具参数。改为对 MCP 工具直接透传：
+
+```python
+def _filter_tool_arguments(self, name: str, arguments: Optional[Dict]) -> Dict:
+    if not arguments:
+        return {}
+    # MCP 工具直接透传参数（schema 由 MCP Server 校验）
+    if name.startswith("mcp__"):
+        return arguments
+    # 内置工具按 schema 过滤
+    schema = self.tools.get(name, {}).get("parameters", {})
+    ...
+```
+
+#### 11.3.4 `_generate_stream` 总是走按需加载（[services/llm_service.py:328-350](file:///d:/timeModel/Mnemo/services/llm_service.py)）
+
+```python
+# v5 纯按需加载：总是按 user query 检索相关 MCP 工具
+user_query = ""
+for msg in reversed(messages):
+    if msg.get("role") == "user":
+        user_query = (msg.get("content") or "").strip()
+        break
+
+dynamic_schemas = ai_tools.get_dynamic_tools_schema(query=user_query, top_k=5)
+tools_payload = adapter.convert_tools(ToolSchemaConverter.from_ai_tools_schema(dynamic_schemas))
+# 不再有 if use_compact_mode 判断
+```
+
+#### 11.3.5 system prompt 简化（[services/llm_service.py:216-229](file:///d:/timeModel/Mnemo/services/llm_service.py)）
+
+```
+【MCP 工具说明（按需加载）】
+系统已根据用户问题自动检索最相关的 MCP 工具，并在 tools 列表中注入了它们的完整 schema。
+- 直接调用 tools 列表中的 mcp__{server}__{tool} 工具即可，按 schema 传参。
+- 如果 tools 列表中没有你需要的 MCP 工具，说明检索未命中，请基于已有工具回答或使用内置工具。
+- 纯对话/知识问答无需调用 MCP 工具，直接回答即可。
+```
+
+#### 11.3.6 `should_use_compact_mode` 总是返回 True（[services/mcp_client_service.py:1006-1020](file:///d:/timeModel/Mnemo/services/mcp_client_service.py)）
+
+保留方法签名兼容 routers/mcp.py 状态查询 API 和前端展示，但语义变为"总是按需加载"：
+
+```python
+def should_use_compact_mode(self, model_name: Optional[str] = None) -> bool:
+    """v5: 总是返回 True（纯按需加载模式）"""
+    return True
+```
+
+### 11.4 验证结果
+
+测试 10 个工具（3 个 server：filesystem/time/github）下的纯按需加载流程：
+
+| 用户问题 | ToolIndex 检索结果 | 命中期望工具 |
+|---------|-------------------|------------|
+| 帮我读取 D:/test.txt 文件 | delete_file, **read_file**, merge_pr | ✅ read_file |
+| 列出目录下所有文件 | **list_directory**, search_files, delete_file | ✅ list_directory rank 1 |
+| 在 GitHub 创建一个新 issue | **create_issue**, list_repos, merge_pr | ✅ create_issue rank 1 |
+| 合并 PR | **merge_pr** | ✅ merge_pr rank 1 |
+| 你好 | (空) | ✅ 无关查询不注入 MCP 工具 |
+| (空 query) | (空) | ✅ 空 query 不注入 MCP 工具 |
+
+**关键验证点**：
+- ✅ `should_use_compact_mode` 对所有模型返回 True
+- ✅ `get_relevant_tool_schemas` 不返回 mcp_list_tools 元工具
+- ✅ 空 query / 无关 query 不注入任何 MCP 工具
+- ✅ LLM 直接 tool calling，无需先调 mcp_list_tools
+
+### 11.5 v5 vs v4 对比
+
+| 维度 | v4 按需加载（有阈值） | v5 纯按需加载 |
+|------|---------------------|-------------|
+| 阈值判断 | 工具数 > 阈值才启用 | **总是启用**，无阈值 |
+| mcp_list_tools 元工具 | 保留作为兜底 | **完全移除** |
+| register_mcp_tools | compact 模式下只注册 wrapper | **总是只注册 wrapper** |
+| _generate_stream | if use_compact_mode 分支 | **无分支，总是走按需加载** |
+| system prompt | 含 compact mode 说明 + 工具摘要 | **简化为工具使用说明** |
+| API 兼容性 | - | should_use_compact_mode 总是返回 True（兼容 routers/mcp.py） |
+
+### 11.6 修改文件清单
+
+| 文件 | 修改类型 | 说明 |
+|------|---------|------|
+| [services/ai_tools.py](file:///d:/timeModel/Mnemo/services/ai_tools.py) | 修改 | `register_mcp_tools` 简化为只注册 wrapper；移除 `_register_mcp_list_tools_meta`；`get_dynamic_tools_schema` 移除 mcp_list_tools 兜底；`_filter_tool_arguments` 对 MCP 工具透传参数；新增 `_cleanup_mcp_tools` |
+| [services/llm_service.py](file:///d:/timeModel/Mnemo/services/llm_service.py) | 修改 | `_generate_stream` 移除 compact mode 判断，总是走按需加载；system prompt 简化 |
+| [services/mcp_client_service.py](file:///d:/timeModel/Mnemo/services/mcp_client_service.py) | 修改 | `should_use_compact_mode` 总是返回 True；`get_compact_tool_summary` 移除内部判断 |
+
+---
+
+## 十二、v6 阈值模式（2026-07-20）
+
+### 12.1 问题：v5 纯按需加载在小工具集下浪费
+
+v5 抛弃了阈值判断，所有请求都走 ToolIndex 检索。但实际场景下：
+- MCP 工具数较少（如 5~10 个）时，全量注入更简单可靠，LLM 能看到所有工具
+- 工具数少时走 ToolIndex 检索反而引入额外开销（embedding 编码 query + 相似度计算）
+- 检索结果可能漏掉相关工具，不如直接全量注入准确
+
+### 12.2 v6 方案：恢复阈值模式，阈值 = 30
+
+```
+工具数 ≤ 30 → 全量注入（所有 MCP 工具 schema 进 tools_payload）
+工具数 > 30 → compact 模式（ToolIndex 检索 + mcp_list_tools 兜底）
+```
+
+compact 模式下的工作流程（同 v4）：
+```
+用户问题
+      │
+      ▼
+Tool Index（embedding 编码工具 name + description）
+      │
+      ▼
+检索最相关的 5 个工具（余弦相似度）
+      │
+      ▼
+加载这些工具的完整 Schema（直接注入 tools_payload）
+      │
+      ▼
+LLM 进行 Tool Calling（mcp_list_tools 作为兜底）
+```
+
+### 12.3 实现细节
+
+#### 12.3.1 `TOOL_COUNT_THRESHOLD = 30`（[services/mcp_client_service.py:27-29](file:///d:/timeModel/Mnemo/services/mcp_client_service.py)）
+
+```python
+# 工具按需加载的阈值：超过此数量时启用 compact 模式（按需加载）
+# v6: 用户指定阈值 30，低于此值走全量注入，高于此值走 ToolIndex 按需加载
+TOOL_COUNT_THRESHOLD = 30
+```
+
+#### 12.3.2 `should_use_compact_mode` 恢复阈值判断（[services/mcp_client_service.py:1006-1020](file:///d:/timeModel/Mnemo/services/mcp_client_service.py)）
+
+```python
+def should_use_compact_mode(self, model_name: Optional[str] = None) -> bool:
+    """v6 恢复阈值判断：用户指定阈值 30。"""
+    return self.total_tool_count > TOOL_COUNT_THRESHOLD
+```
+
+#### 12.3.3 `register_mcp_tools` 恢复 compact/全量两分支（[services/ai_tools.py:432-493](file:///d:/timeModel/Mnemo/services/ai_tools.py)）
+
+```python
+def register_mcp_tools(self, manager, force_compact: Optional[bool] = None) -> int:
+    """v6 恢复阈值模式"""
+    use_compact = force_compact if force_compact is not None else manager.should_use_compact_mode()
+
+    if use_compact:
+        # compact 模式：只注册 wrapper + mcp_list_tools 元工具
+        registered = self._register_mcp_compact_mode(manager)
+        return registered
+
+    # 全量模式：注册所有 MCP 工具到 self.tools
+    for tool_schema in all_tools:
+        self.register_tool(name=tool_name, ...)
+```
+
+#### 12.3.4 `_register_mcp_compact_mode` 保留 mcp_list_tools 兜底（[services/ai_tools.py:495-548](file:///d:/timeModel/Mnemo/services/ai_tools.py)）
+
+compact 模式下：
+- 所有 MCP 工具 wrapper 注册到 async_tools + self.functions（保证可执行）
+- 注册 mcp_list_tools 元工具到 self.tools（让 LLM 能主动查询未检索到的工具）
+- tools_payload 由 `get_dynamic_tools_schema(query)` 实时检索注入
+
+#### 12.3.5 `_generate_stream` 恢复 compact mode 判断（[services/llm_service.py:316-348](file:///d:/timeModel/Mnemo/services/llm_service.py)）
+
+```python
+use_compact_mode = (
+    mcp_client_manager.is_enabled
+    and mcp_client_manager.should_use_compact_mode(self.model_name)
+)
+
+if use_compact_mode:
+    # compact 模式：按 user query 检索相关 MCP 工具
+    dynamic_schemas = ai_tools.get_dynamic_tools_schema(
+        query=user_query, top_k=5, include_mcp_list_tools=True
+    )
+    tools_payload = adapter.convert_tools(...)
+else:
+    # 全量模式：注入所有工具 schema
+    tools_payload = adapter.convert_tools(ai_tools.get_tools_schema())
+```
+
+#### 12.3.6 `get_dynamic_tools_schema` 恢复 mcp_list_tools 兜底（[services/ai_tools.py:275-326](file:///d:/timeModel/Mnemo/services/ai_tools.py)）
+
+```python
+def get_dynamic_tools_schema(self, query, top_k=5, include_mcp_list_tools=True):
+    schemas = []
+    # 1. 内置工具
+    schemas.extend([s for s in self.tools.values() if not s["name"].startswith("mcp__")])
+    # 2. 按 query 检索相关 MCP 工具
+    schemas.extend(mcp_client_manager.get_relevant_tool_schemas(query, top_k=top_k))
+    # 3. 兜底元工具：mcp_list_tools
+    if include_mcp_list_tools:
+        schemas.append(self.tools["mcp_list_tools"])
+    return schemas
+```
+
+#### 12.3.7 system prompt 恢复 compact mode 说明（[services/llm_service.py:216-238](file:///d:/timeModel/Mnemo/services/llm_service.py)）
+
+```
+【MCP 工具说明（按需加载模式）】
+当前 MCP 工具数量较多（> 30），已启用按需加载模式。
+
+## 工作方式
+- 系统已根据用户问题自动检索最相关的 MCP 工具，并注入了它们的完整 schema。
+- 直接调用已注入的 mcp__{server}__{tool} 工具即可，无需先调 mcp_list_tools。
+- 只有当你需要的工具不在已注入列表中时，才调 mcp_list_tools(server_name) 查询其他工具。
+
+## 决策流程
+1. 查看当前 tools 列表，看是否有匹配用户需求的 mcp__ 工具。
+2. 如果有：直接调用（按 schema 传参）。
+3. 如果没有但你确信存在该 MCP 工具：调 mcp_list_tools(server_name) 查询。
+4. 如果不需要 MCP 工具（纯对话/知识问答）：直接回答。
+
+## 全部 MCP 工具摘要（供你判断是否需要调 mcp_list_tools）
+{compact_summary}
+```
+
+### 12.4 验证结果
+
+| 场景 | 工具数 | 阈值 | should_use_compact_mode | 模式 |
+|------|-------|------|------------------------|------|
+| 工具数 < 阈值 | 10 | 30 | False | 全量注入 |
+| 工具数 = 阈值（边界） | 30 | 30 | False | 全量注入 |
+| 工具数 > 阈值 | 50 | 30 | True | compact 模式（按需加载） |
+
+**compact 模式（50 工具）下的按需加载流程**：
+```
+用户问题: '执行 fs 操作 1'
+ToolIndex 检索到 5 个工具: ['mcp__fs__tool_1', 'mcp__fs__tool_10', 'mcp__fs__tool_0', ...]
+get_relevant_tool_schemas 返回 5 个 schema
+→ LLM 直接调用注入的工具，mcp_list_tools 作为兜底
+```
+
+### 12.5 v6 vs v5 对比
+
+| 维度 | v5 纯按需加载 | v6 阈值模式 |
+|------|-------------|------------|
+| 阈值判断 | 无（总是按需加载） | **工具数 > 30 才启用 compact** |
+| 小工具集（≤30） | 走 ToolIndex 检索 | **全量注入（更简单可靠）** |
+| 大工具集（>30） | 走 ToolIndex 检索 | 走 ToolIndex 检索 + mcp_list_tools 兜底 |
+| mcp_list_tools 元工具 | 完全移除 | **compact 模式下保留作为兜底** |
+| 检索准确性风险 | 所有请求都承担 | **仅大工具集承担** |
+
+### 12.6 修改文件清单
+
+| 文件 | 修改类型 | 说明 |
+|------|---------|------|
+| [services/mcp_client_service.py](file:///d:/timeModel/Mnemo/services/mcp_client_service.py) | 修改 | `TOOL_COUNT_THRESHOLD` 改为 30；`should_use_compact_mode` 恢复阈值判断 |
+| [services/ai_tools.py](file:///d:/timeModel/Mnemo/services/ai_tools.py) | 修改 | `register_mcp_tools` 恢复 compact/全量两分支；`_register_mcp_compact_mode` 保留 mcp_list_tools 兜底；`get_dynamic_tools_schema` 恢复 `include_mcp_list_tools` 参数 |
+| [services/llm_service.py](file:///d:/timeModel/Mnemo/services/llm_service.py) | 修改 | `_generate_stream` 恢复 compact mode 判断分支；system prompt 恢复 compact mode 说明 |

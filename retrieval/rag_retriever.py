@@ -117,13 +117,15 @@ class RAGRetriever:
         use_graph = strategy in ("auto", "graph")
 
         # 运行时开关：决定是否启用图谱检索/重排等高耗模块
+        # 注意：MongoDB 未连接时不能兜底为 True，否则会意外加载 reranker 模型导致 OOM
         try:
             from services.runtime_config import get_runtime_config
 
             runtime_cfg = await get_runtime_config()
             modules = runtime_cfg.get("modules") or {}
-            if not bool(modules.get("rerank_enabled", True)):
-                self.enable_reranker = False
+            # 只有 MongoDB 显式配置了 rerank_enabled 时才覆盖
+            if "rerank_enabled" in modules:
+                self.enable_reranker = bool(modules.get("rerank_enabled"))
         except Exception:
             modules = {}
 
@@ -190,14 +192,31 @@ class RAGRetriever:
             tasks.append(asyncio.gather(*vector_tasks))
             task_names.append("vector")
 
-        results_list = await asyncio.gather(*tasks)
+        # return_exceptions=True 作为双保险：三路检索内部已 try/except 吞异常返回 []，
+        # 但若漏网异常冒泡到这里，return_exceptions 能保证单路失败不拖垮其他两路。
+        # 详见 docs/failure-modes.md
+        results_list = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 按 task_names 顺序解析各路结果，缺失的路用空列表占位
+        # 按 task_names 顺序解析各路结果，缺失的路或异常路用空列表占位
         vector_groups: List[List[Dict[str, Any]]] = []
         keyword_groups: List[List[Dict[str, Any]]] = []
         graph_results: List[Dict[str, Any]] = []
 
         for name, res in zip(task_names, results_list):
+            # return_exceptions=True 下 res 可能是 Exception 实例
+            if isinstance(res, Exception):
+                logger.error(
+                    f"检索路径 '{name}' 未捕获异常（已降级为空结果）: {res}",
+                    exc_info=res,
+                )
+                res = [] if name != "graph" else []
+                if name == "vector":
+                    vector_groups = []
+                elif name == "keyword":
+                    keyword_groups = []
+                elif name == "graph":
+                    graph_results = []
+                continue
             if name == "vector":
                 vector_groups = res
             elif name == "keyword":
@@ -207,9 +226,30 @@ class RAGRetriever:
 
         vector_results = self._flatten_ranked_groups(vector_groups)
         keyword_results = self._flatten_ranked_groups(keyword_groups)
-        
+
         # 2. 混合检索结果（合并和初步去重）
         merged_results = self._merge_results(vector_results, keyword_results, graph_results)
+
+        # 2.1 RRF 融合后相对阈值过滤
+        # 注意：RRF 分数范围（~0.001-0.05）与 score_threshold（默认 0.7，用于向量检索）完全不匹配，
+        # 不能直接复用 self.score_threshold。这里用相对阈值：低于 top1 * ratio 的剔除，
+        # 避免低分噪声（如 0.003 分的 chunk）进入下游 reranker / LLM 上下文 / 前端 evidence 展示。
+        # ratio 通过环境变量 RRF_FILTER_RATIO 控制，默认 0.1（与 fusion.py 中 keyword/graph 的 ratio 一致）。
+        if merged_results:
+            top_score = float(merged_results[0].get("score", 0.0) or 0.0)
+            if top_score > 0:
+                rrf_filter_ratio = float(os.getenv("RRF_FILTER_RATIO", "0.1"))
+                threshold = top_score * rrf_filter_ratio
+                before_count = len(merged_results)
+                merged_results = [
+                    r for r in merged_results
+                    if float(r.get("score", 0.0) or 0.0) >= threshold
+                ]
+                if before_count != len(merged_results):
+                    logger.debug(
+                        f"RRF 融合后相对阈值过滤: {before_count} -> {len(merged_results)} "
+                        f"(top1={top_score:.4f}, threshold={threshold:.4f}, ratio={rrf_filter_ratio})"
+                    )
 
         # 2.5 排除已检索过的 chunk（Agent 跨轮次去重）
         if exclude_chunk_ids:
@@ -565,9 +605,10 @@ class RAGRetriever:
 
     def _tokenize(self, text: str) -> List[str]:
         # Phase 3 优化：统一走 utils/tokenizer.py，支持驼峰切分 + 专有名词词典
-        # 注意：查询端用 tokenize（不过滤停用词），避免破坏中文匹配
-        from utils.tokenizer import tokenize
-        return tokenize(text)
+        # 查询端用 tokenize_for_query（过滤停用词），避免高频虚词稀释 BM25 关键词权重
+        # 修复：之前用 tokenize（不过滤停用词），导致 keyword recall@5 从 0.3 跌到 0.007
+        from utils.tokenizer import tokenize_for_query
+        return tokenize_for_query(text)
 
     def _tokenize_weighted(self, text: str):
         """Phase 3 优化：查询端加权分词（英文 token 权重更高）
@@ -591,89 +632,213 @@ class RAGRetriever:
             return []
 
     async def _graph_search(self, query: str, document_id: Optional[str]) -> List[Dict[str, Any]]:
-        """图谱检索"""
+        """图谱检索
+
+        打分策略（v2 修复：原版所有结果都是固定 0.75 分无区分度；v1 打分重写后短节点名
+        反向包含匹配刷分，"Ne"/"R"/"am" 等短节点被任意包含该子串的实体命中累加到高分）：
+        - 精确匹配（toLower(n.name) == entity）：1.0 分
+        - 节点名包含 query 实体（如 "lung cancer" contains "cancer"）：0.8 分
+        - query 实体包含节点名（如 "smoking cessation" contains "smoking"）：0.6 分
+          ※ 反向包含要求节点名 ≥4 字符，避免 "ne" in "homocysteine" 等短子串噪声
+        - fallback（Cypher CONTAINS 命中但分数分支未匹配）：0.3 分
+        - 单实体对同一 chunk 只取最高分（不累加），跨实体再累加
+          ※ 避免 "Ne" 节点 6 条边都指向同一 chunk 累加到 3.6 分压过真实 1.0 分精确匹配
+        """
         try:
             # 1. 提取查询实体
             entities = await knowledge_extraction_service.extract_entities(query)
             if not entities:
                 return []
-            
-            results = []
+
+            # 过滤过短实体（单字母如 "R" 会匹配大量噪声）
+            # 保留 2 字符的缩写（如 "UK"、"PrP" 去掉后变小写 "uk"、"prp"）
+            # 但纯单字母实体跳过
+            filtered_entities = []
+            for ent in entities:
+                ent_lower = ent.lower().strip()
+                if len(ent_lower) < 2:
+                    continue
+                # 单字母 + 数字组合（如 "R" "Ne"）太短容易误匹配，要求至少 2 个字母
+                alpha_chars = [c for c in ent_lower if c.isalpha()]
+                if len(alpha_chars) < 2:
+                    continue
+                filtered_entities.append((ent, ent_lower))
+
+            if not filtered_entities:
+                return []
+
             if neo4j_client.driver is None:
                 neo4j_client.connect()
-                
+
+            # chunk_id -> {entity_lower: max_score} 单实体取 max，跨实体再 sum
+            # 避免 "Ne" 节点 6 条边都指向同一 chunk 单实体内累加到 3.6 分
+            chunk_entity_scores: Dict[str, Dict[str, float]] = {}
+            chunk_relations: Dict[str, List[str]] = {}
+            chunk_doc_ids: Dict[str, set] = {}
+
             if neo4j_client.driver:
-                for entity in entities:
+                for entity, entity_lower in filtered_entities:
+                    # LIMIT 50：原 LIMIT 10 会截断掉精确匹配边（Ne 等高频节点边先返回）
                     cypher = (
-                        f"MATCH (n {{name: $name}})-[r]->(m) "
-                        f"RETURN n.name as head, type(r) as relation, m.name as tail, r.source_doc as doc_id, r.source_chunk as chunk_id LIMIT 10"
+                        f"MATCH (n)-[r]-(m) "
+                        f"WHERE (toLower(n.name) CONTAINS $name OR $name CONTAINS toLower(n.name)) "
+                        f"AND r.source_doc = $doc_id "
+                        f"RETURN n.name as head, type(r) as relation, m.name as tail, "
+                        f"r.source_doc as doc_id, r.source_chunk as chunk_id LIMIT 50"
                     )
-                    records = await asyncio.to_thread(neo4j_client.execute_query, cypher, {"name": entity})
-                    
-                    if records:
-                        text_parts = []
-                        chunk_ids = set()
-                        doc_ids = set()
-                        
-                        for record in records:
-                            head = record.get('head')
-                            relation = record.get('relation')
-                            tail = record.get('tail')
-                            if head and relation and tail:
-                                text_parts.append(f"{head} {relation} {tail}")
-                            
-                            if record.get('chunk_id'):
-                                chunk_ids.add(record.get('chunk_id'))
-                            if record.get('doc_id'):
-                                doc_ids.add(record.get('doc_id'))
-                        
-                        if document_id and document_id not in doc_ids:
+                    records = await asyncio.to_thread(
+                        neo4j_client.execute_query, cypher,
+                        {"name": entity_lower, "doc_id": document_id or ""}
+                    )
+
+                    for record in records:
+                        head = (record.get('head') or '').lower()
+                        tail = (record.get('tail') or '').lower()
+                        relation = record.get('relation')
+                        chunk_id = record.get('chunk_id')
+                        doc_id = record.get('doc_id')
+
+                        if not chunk_id:
                             continue
 
-                        # 批量查询所有 chunk_ids（用 asyncio.to_thread 包装同步 MongoDB 调用）
-                        chunk_ids_list = [str(cid) for cid in chunk_ids]
-                        if chunk_ids_list:
-                            def _batch_get_chunks(ids=chunk_ids_list):
-                                from bson import ObjectId
-                                try:
-                                    oids = [ObjectId(cid) for cid in ids]
-                                except Exception:
-                                    return []
-                                docs = self.chunk_repo.collection.find({"_id": {"$in": oids}})
-                                return [{**d, "_id": str(d["_id"])} for d in docs]
+                        # 计算匹配分数
+                        score = 0.0
+                        # head 精确匹配
+                        if head == entity_lower:
+                            score = 1.0
+                        # tail 精确匹配
+                        elif tail == entity_lower:
+                            score = 1.0
+                        # head 包含 entity（如 "lung cancer" contains "cancer"）—— 正向包含
+                        elif entity_lower in head:
+                            score = 0.8
+                        # tail 包含 entity
+                        elif entity_lower in tail:
+                            score = 0.8
+                        # entity 包含 head（如 "smoking cessation" contains "smoking"）—— 反向包含
+                        # ※ 要求节点名 ≥4 字符，避免 "ne" in "homocysteine" 等短子串噪声
+                        elif len(head) >= 4 and head in entity_lower:
+                            score = 0.6
+                        elif len(tail) >= 4 and tail in entity_lower:
+                            score = 0.6
+                        else:
+                            score = 0.3
 
-                            fetched_chunks = await asyncio.to_thread(_batch_get_chunks)
-                            for chunk in fetched_chunks:
-                                if document_id and chunk.get("document_id") != document_id:
-                                    continue
-                                meta = (chunk.get("metadata") or {}).copy()
-                                meta["graph_relations"] = text_parts
-                                results.append({
-                                    "id": str(chunk.get("_id")),
-                                    "score": 0.75,
-                                    "payload": {
-                                        "chunk_id": str(chunk.get("_id")),
-                                        "document_id": chunk.get("document_id"),
-                                        "text": chunk.get("text"),
-                                        "chunk_index": chunk.get("chunk_index"),
-                                        "metadata": meta,
-                                        "retrieval_type": "graph",
-                                        "entities": entities,
-                                    }
-                                })
+                        cid = str(chunk_id)
+                        # 单实体对同一 chunk 取 max（不累加），避免高频节点多边刷分
+                        ent_map = chunk_entity_scores.setdefault(cid, {})
+                        if score > ent_map.get(entity_lower, 0.0):
+                            ent_map[entity_lower] = score
+                        if cid not in chunk_relations:
+                            chunk_relations[cid] = []
+                            chunk_doc_ids[cid] = set()
+                        head_raw = record.get('head')
+                        tail_raw = record.get('tail')
+                        if head_raw and relation and tail_raw:
+                            chunk_relations[cid].append(f"{head_raw} {relation} {tail_raw}")
+                        if doc_id:
+                            chunk_doc_ids[cid].add(doc_id)
 
-                        if text_parts and not chunk_ids:
-                            combined_text = "Knowledge Graph Context:\n" + "\n".join(text_parts)
-                            results.append({
-                                "id": f"graph_{entity}",
-                                "score": 0.35,
-                                "payload": {
-                                    "text": combined_text,
-                                    "retrieval_type": "graph",
-                                    "entities": entities,
-                                    "metadata": {"graph_relations": text_parts},
-                                }
-                            })
+            # 跨实体 sum：每个 chunk 的总分 = 各实体对该 chunk 的最高分之和
+            chunk_scores: Dict[str, float] = {
+                cid: sum(ent_map.values())
+                for cid, ent_map in chunk_entity_scores.items()
+            }
+
+            if not chunk_scores:
+                return []
+
+            # 过滤 document_id 不匹配的 chunk
+            valid_chunk_ids = []
+            for cid, doc_ids in chunk_doc_ids.items():
+                if document_id and document_id not in doc_ids:
+                    continue
+                valid_chunk_ids.append(cid)
+
+            if not valid_chunk_ids:
+                return []
+
+            # 批量查询 chunk 文本
+            def _batch_get_chunks(ids=valid_chunk_ids):
+                from bson import ObjectId, errors as bson_errors
+                oids = []
+                non_oid_ids = []
+                for cid in ids:
+                    try:
+                        oids.append(ObjectId(cid))
+                    except (bson_errors.InvalidId, TypeError):
+                        non_oid_ids.append(cid)
+
+                query_filter = None
+                if oids and not non_oid_ids:
+                    query_filter = {"_id": {"$in": oids}}
+                elif oids:
+                    query_filter = {"$or": [
+                        {"_id": {"$in": oids}},
+                        {"metadata.source_chunk": {"$in": non_oid_ids}},
+                    ]}
+                else:
+                    scifact_ids = []
+                    for cid in non_oid_ids:
+                        if cid.startswith("scifact_"):
+                            scifact_ids.append(cid[len("scifact_"):])
+                    or_clauses = []
+                    if non_oid_ids:
+                        or_clauses.append({"metadata.source_chunk": {"$in": non_oid_ids}})
+                    if scifact_ids:
+                        or_clauses.append({"metadata.scifact_id": {"$in": scifact_ids}})
+                    if or_clauses:
+                        query_filter = {"$or": or_clauses}
+
+                if not query_filter:
+                    return []
+                docs = self.chunk_repo.collection.find(query_filter)
+                return [{**d, "_id": str(d["_id"])} for d in docs]
+
+            fetched_chunks = await asyncio.to_thread(_batch_get_chunks)
+
+            # 用 chunk 的 source_chunk 或 _id 匹配回 chunk_scores
+            # fetched_chunks 可能包含 parent 和 child，需要映射到 source_chunk key
+            results = []
+            for chunk in fetched_chunks:
+                if document_id and chunk.get("document_id") != document_id:
+                    continue
+                meta = (chunk.get("metadata") or {}).copy()
+                # 尝试匹配 chunk_scores 的 key
+                cid_str = str(chunk.get("_id"))
+                source_chunk = meta.get("source_chunk", "")
+                scifact_id = meta.get("scifact_id", "")
+                # 匹配策略：优先 source_chunk，其次 scifact_id 拼接，最后 _id
+                score = 0.0
+                relations = []
+                matched_key = None
+                for key in [source_chunk, f"scifact_{scifact_id}", cid_str]:
+                    if key in chunk_scores:
+                        score = max(score, chunk_scores[key])
+                        relations = chunk_relations.get(key, [])
+                        matched_key = key
+                        break
+
+                if score <= 0:
+                    continue
+
+                meta["graph_relations"] = relations
+                results.append({
+                    "id": cid_str,
+                    "score": score,
+                    "payload": {
+                        "chunk_id": cid_str,
+                        "document_id": chunk.get("document_id"),
+                        "text": chunk.get("text"),
+                        "chunk_index": chunk.get("chunk_index"),
+                        "metadata": meta,
+                        "retrieval_type": "graph",
+                        "entities": [e[0] for e in filtered_entities],
+                    }
+                })
+
+            # 按分数降序排序
+            results.sort(key=lambda x: x["score"], reverse=True)
             return results
         except Exception as e:
             logger.error(f"图谱检索失败: {e}")
@@ -698,17 +863,18 @@ class RAGRetriever:
 
         权重通过环境变量配置，便于消融实验：
         - RRF_WEIGHT_VECTOR（默认 1.0，主路）
-        - RRF_WEIGHT_KEYWORD（默认 0.3，辅助；原 0.8 过高会让 BM25 噪声稀释 vector）
-        - RRF_WEIGHT_GRAPH（默认 0.2，辅助）
+        - RRF_WEIGHT_KEYWORD（默认 0.1，辅助；SciFact 消融实验确定，0.3 会拖累 nDCG）
+        - RRF_WEIGHT_GRAPH（默认 0.0，图谱为空时无贡献；抽取后需重新消融）
 
-        消融实验配置示例：
-        - 等权 RRF: RRF_WEIGHT_VECTOR=1.0 RRF_WEIGHT_KEYWORD=1.0 RRF_WEIGHT_GRAPH=1.0
-        - vector 主导: RRF_WEIGHT_VECTOR=1.0 RRF_WEIGHT_KEYWORD=0.1 RRF_WEIGHT_GRAPH=0.1
-        - 纯 vector: RRF_WEIGHT_VECTOR=1.0 RRF_WEIGHT_KEYWORD=0.0 RRF_WEIGHT_GRAPH=0.0
+        SciFact 300 题消融实验结论（2026-07-22）：
+        - kw=0.1: nDCG@10=0.6577（最佳，优于纯向量 0.6528）
+        - kw=0.3: nDCG@10=0.6410（旧默认，反而低于纯向量，BM25 噪声稀释）
+        - kw=1.0: nDCG@10=0.6255（等权最差，keyword 弱时不能等权）
+        - vector 权重越大 nDCG 越高（0.5→1.5: 0.6416→0.6532）
         """
         w_vector = float(os.getenv("RRF_WEIGHT_VECTOR", "1.0"))
-        w_keyword = float(os.getenv("RRF_WEIGHT_KEYWORD", "0.3"))
-        w_graph = float(os.getenv("RRF_WEIGHT_GRAPH", "0.2"))
+        w_keyword = float(os.getenv("RRF_WEIGHT_KEYWORD", "0.1"))
+        w_graph = float(os.getenv("RRF_WEIGHT_GRAPH", "0.0"))
         lists = [
             ("vector", vector_results, w_vector),
             ("keyword", keyword_results, w_keyword),

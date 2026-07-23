@@ -6,12 +6,13 @@ from chunking.simple_chunker import SimpleChunker
 from chunking.smart_chunker import SmartChunker
 from chunking.hybrid_chunker import HybridChunker
 from chunking.report_chunker import ReportChunker
+from chunking.parent_child_chunker import ParentChildChunker
 from utils.logger import logger
 
 
 class ContentAnalyzer:
     """内容分析路由器 - 智能分发文档到合适的分块器"""
-    
+
     # 分块器类型枚举
     CHUNKER_TYPE_RECURSIVE = "recursive"  # LangChain 递归分块器（高度结构化内容）
     CHUNKER_TYPE_SEMANTIC = "semantic"  # 语义分块器（需要保持语义连贯性）
@@ -19,7 +20,8 @@ class ContentAnalyzer:
     CHUNKER_TYPE_LEGACY = "legacy"  # 简单分块器（通用型）
     CHUNKER_TYPE_HYBRID = "hybrid"  # 混合分块器（规则+语义）
     CHUNKER_TYPE_REPORT = "report"  # 行业报告分块器（结构 + token 预算）
-    
+    CHUNKER_TYPE_PARENT_CHILD = "parent_child"  # 父子分块器（small-to-big）
+
     def __init__(self):
         """初始化内容分析器"""
         self.recursive_chunker = None
@@ -28,6 +30,7 @@ class ContentAnalyzer:
         self.legacy_chunker = None
         self.hybrid_chunker = None
         self.report_chunker = None
+        self.parent_child_chunker = None
     
     def _get_recursive_chunker(self) -> RecursiveChunker:
         """获取 LangChain 递归分块器（延迟初始化）"""
@@ -77,6 +80,12 @@ class ContentAnalyzer:
         if self.report_chunker is None:
             self.report_chunker = ReportChunker()
         return self.report_chunker
+
+    def _get_parent_child_chunker(self) -> ParentChildChunker:
+        """获取父子分块器（延迟初始化）"""
+        if self.parent_child_chunker is None:
+            self.parent_child_chunker = ParentChildChunker()
+        return self.parent_child_chunker
     
     def _detect_highly_structured(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> bool:
         """
@@ -254,16 +263,18 @@ class ContentAnalyzer:
     def route(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> Tuple[str, Any]:
         """
         路由文本到合适的分块器
-        
+
         路由策略（按优先级）：
-        1. 高度结构化内容（代码、论文）-> 递归分块器
-        2. 包含公式、表格或需要保持语义连贯性的长文档 -> 混合分块器 (升级版)
-        3. 其他文档 -> 简单分块器
-        
+        1. 超长报告（>=100k 字符）-> 行业报告分块器
+        2. 高度结构化内容（代码、论文）-> 递归分块器
+        3. 包含公式、表格或需要保持语义连贯性的长文档 -> 混合分块器 (升级版)
+        4. 中等长度文档（>=3000 字符）-> 父子分块器（small-to-big，精准命中+完整上下文）
+        5. 短文档 -> 简单分块器
+
         Args:
             text: 要分块的文本
             metadata: 可选的元数据（可能包含解析器提取的表格、公式、代码块等信息）
-        
+
         Returns:
             (分块器类型, 分块器实例) 元组
         """
@@ -271,7 +282,7 @@ class ContentAnalyzer:
             # 空文本使用简单分块器
             logger.info("空文本，使用简单分块器")
             return self.CHUNKER_TYPE_LEGACY, self._get_legacy_chunker()
-        
+
         # 0. 超长报告优先：结构 + token 预算分块
         # 行业报告通常章节明显、文本极长，用 report chunker 能提升语义完整性与可控性
         text_length = len(text)
@@ -283,18 +294,26 @@ class ContentAnalyzer:
         # （优先级最高，因为代码和论文需要精确的结构化分块）
         if self._detect_highly_structured(text, metadata):
             return self.CHUNKER_TYPE_RECURSIVE, self._get_recursive_chunker()
-        
+
         # 2. 检测包含公式或表格的文档 -> 混合分块器 (替代智能分块器)
         if self._detect_formulas_or_tables(text, metadata):
             logger.info("检测到公式或表格，使用混合分块器")
             return self.CHUNKER_TYPE_HYBRID, self._get_hybrid_chunker()
-        
+
         # 3. 检测需要语义连贯性的内容 -> 混合分块器 (替代语义分块器)
         if self._detect_semantic_coherence_required(text, metadata):
             logger.info("检测到需要语义连贯性的内容，使用混合分块器")
             return self.CHUNKER_TYPE_HYBRID, self._get_hybrid_chunker()
-        
-        # 4. 默认使用简单分块器（通用型，适合大多数场景）
+
+        # 4. 长文档 -> 父子分块器（small-to-big）
+        # child 小块做向量化（精准命中），parent 大块回查返回（完整上下文）
+        # 阈值 3000：仅对真正长文档生效（论文全文/法律文档/技术报告等）
+        # 短文本（<3000 字符）本身是完整语义单元，切父子反而破坏语义、parent 比原文还小
+        if text_length >= 3000:
+            logger.info(f"✓ 检测到长文档 ({text_length} 字符)，使用父子分块器（small-to-big）")
+            return self.CHUNKER_TYPE_PARENT_CHILD, self._get_parent_child_chunker()
+
+        # 5. 默认使用简单分块器（通用型，适合短文档）
         logger.info("使用简单分块器（通用型）")
         return self.CHUNKER_TYPE_LEGACY, self._get_legacy_chunker()
 

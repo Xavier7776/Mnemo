@@ -878,7 +878,23 @@ class ChunkRepository:
         end = int(chunk_index) + int(window)
         indices = list(range(start, end + 1))
         return self.get_chunks_by_indices(document_id, indices)
-    
+
+    def update_chunk_metadata(self, chunk_id: str, metadata_update: Dict[str, Any]) -> bool:
+        """合并更新指定 chunk 的 metadata 字段（不覆盖整个 metadata）
+
+        用于父子分块入库时，child 在 parent 之前入库，需要二轮回填 parent_chunk_id。
+        """
+        try:
+            from bson import ObjectId
+            sanitized = self._sanitize_for_bson(metadata_update)
+            result = self.collection.update_one(
+                {"_id": ObjectId(chunk_id)},
+                {"$set": {f"metadata.{k}": v for k, v in sanitized.items()}},
+            )
+            return result.modified_count > 0
+        except Exception:
+            return False
+
     def delete_chunks_by_document(self, document_id: str):
         """删除文档的所有块"""
         # 阶段二：删除前先清理 Redis 倒排索引

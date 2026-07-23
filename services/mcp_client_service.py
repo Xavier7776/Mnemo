@@ -24,9 +24,11 @@ from services.mcp_circuit_breaker import CircuitBreaker
 from services.mcp_call_log import mcp_call_log, CallRecord
 
 
-# 工具按需加载的阈值：超过此数量时启用摘要模式
-# v3: 作为兜底默认值，实际阈值由 get_adaptive_tool_threshold(model_name) 动态计算
-TOOL_COUNT_THRESHOLD = 20
+# 工具按需加载的阈值：超过此数量时启用 compact 模式（按需加载）
+# v6: 用户指定阈值 30，低于此值走全量注入，高于此值走 ToolIndex 按需加载
+# v6.2: 阈值改为 100。实测 30 以下工具全量注入仍会因 ToolIndex 索引构建拖慢启动，
+#       100 以内的 schema 总 token 量在主流模型 context window 里仍可承受。
+TOOL_COUNT_THRESHOLD = 100
 
 # 健康检查配置
 HEALTH_CHECK_INTERVAL = 30.0  # 每 30 秒 ping 一次
@@ -507,8 +509,12 @@ class MCPClientManager:
         session = self._sessions[server_name]
         try:
             # MCP 协议内置的 ping 方法
+            # v6.2 修复：用 session.send_ping() 替代手写的 send_request("ping", {})
+            # mcp 库的 send_request 签名是 send_request(request, result_type, ...)
+            # 旧代码传 ("ping", {}) 会被当作 (request="ping", result_type={})
+            # result_type={} 在内部访问 .model_dump() 时报 'str' object has no attribute 'model_dump'
             await asyncio.wait_for(
-                session.send_request("ping", {}),
+                session.send_ping(),
                 timeout=HEALTH_CHECK_TIMEOUT,
             )
             # ping 成功，清除断连标记
@@ -1004,65 +1010,46 @@ class MCPClientManager:
     # —— 工具按需加载 —— 
 
     def should_use_compact_mode(self, model_name: Optional[str] = None) -> bool:
-        """是否应该使用紧凑模式（工具数量超过阈值时启用）
+        """是否启用 compact 模式（工具数 > 阈值时启用按需加载）
 
-        紧凑模式下，只注入工具摘要到 system prompt，
-        LLM 通过 mcp_list_tools 发现具体工具后再调用。
-
-        v3 增强：根据 LLM 模型的 context window 自适应调整阈值。
-        - 传入 model_name 时：用 get_adaptive_tool_threshold(model_name) 动态计算阈值
-          （8K→15, 16K→18, 32K→22, 64K→28, 128K→35, >128K→40）
-        - 不传 model_name 时：用默认常量 TOOL_COUNT_THRESHOLD（=20，向后兼容）
+        v6 恢复阈值判断：用户指定阈值 100（v6.2 从 30 调整为 100）。
+        - 工具数 ≤ 100：走全量注入（所有 MCP 工具 schema 进 tools_payload）
+        - 工具数 > 100：走按需加载（ToolIndex 检索相关工具，只注入 top_k 个 schema）
+        - model_name 参数保留向后兼容，但 v6 改为固定阈值，不再自适应
 
         Args:
-            model_name: LLM 模型名（如 "mimo-v2.5"、"gpt-4o"），None 时用默认阈值
+            model_name: LLM 模型名（v6 后不再使用，保留向后兼容）
 
         Returns:
-            是否启用紧凑模式
+            是否启用 compact 模式
         """
-        if model_name:
-            threshold = get_adaptive_tool_threshold(model_name)
-        else:
-            threshold = TOOL_COUNT_THRESHOLD
-        return self.total_tool_count > threshold
+        return self.total_tool_count > TOOL_COUNT_THRESHOLD
 
     def get_compact_tool_summary(self) -> str:
-        """获取紧凑模式的工具摘要（用于注入 system prompt）
+        """获取所有 MCP 工具的摘要文本（用于状态展示/调试）
 
-        v2 增强：每个工具加入 description 摘要，让 LLM 不用调 mcp_list_tools 就能判断是否需要该工具。
-        v3 调整：compact mode 已改为按需加载（ToolIndex 检索相关工具直接注入 schema），
-                此方法保留用于 system prompt 中告知 LLM 可用工具的全貌。
-
-        格式示例：
-            [filesystem] 11 个工具:
-              - mcp__filesystem__read_file: 读取文件内容（支持文本/二进制）
-              - mcp__filesystem__write_file: 写入文件内容
-              - mcp__filesystem__list_directory: 列出目录下的文件
-              ...
+        v5 改造：不再用于 system prompt 注入（按需加载模式下 LLM 直接拿到相关工具的完整 schema）。
+        保留方法用于 routers/mcp.py 状态查询和调试。
 
         Returns:
             工具摘要文本
         """
-        if not self.should_use_compact_mode():
+        if not self._tools:
             return ""
 
-        lines = ["MCP 工具摘要（含简短说明，使用 mcp_list_tools 查看完整 schema）:"]
+        lines = ["MCP 工具摘要:"]
         for server_name, tools in self._tools.items():
             lines.append(f"\n[{server_name}] {len(tools)} 个工具:")
             for tool in tools:
                 # 提取 description 的第一行/第一句，截断到 60 字符
                 desc_raw = (tool.description or "").strip()
-                # 取第一行（很多 MCP 工具 description 是多行）
                 desc_first_line = desc_raw.split("\n")[0].strip() if desc_raw else ""
-                # 取第一句（按。或. 分割）
                 if "。" in desc_first_line:
                     desc_first_line = desc_first_line.split("。")[0].strip()
                 elif ". " in desc_first_line:
                     desc_first_line = desc_first_line.split(". ")[0].strip()
-                # 截断到 60 字符
                 if len(desc_first_line) > 60:
                     desc_first_line = desc_first_line[:57] + "..."
-                # 去掉工具名里的 server 前缀（如 mcp__filesystem__read_file → read_file）
                 short_name = tool.name
                 if short_name.startswith(f"mcp__{server_name}__"):
                     short_name = short_name[len(f"mcp__{server_name}__"):]
@@ -1085,14 +1072,28 @@ class MCPClientManager:
         - initialize() 完成后
         - 热加载增删 Server 后
         - 重连成功后（工具列表可能变化）
-        """
-        from services.mcp_tool_index import mcp_tool_index
 
+        v6.2: 工具数 ≤ TOOL_COUNT_THRESHOLD(100) 时跳过构建，避免无谓的 embedding
+        索引开销拖慢启动。compact 模式未启用时 get_relevant_tool_schemas 也走全量返回。
+        注意：import mcp_tool_index 会触发模块级单例 ToolIndex() 的 embedding 初始化，
+        所以必须延迟到阈值检查通过后再 import。
+        """
         if not self._tools:
             logger.info("ToolIndex 构建：无工具可索引（MCP 未连接或未启用）")
+            from services.mcp_tool_index import mcp_tool_index
             mcp_tool_index.clear()
             return
 
+        # v6.2: 工具数未达阈值时跳过索引构建（全量注入路径不需要 ToolIndex）
+        # 不 import mcp_tool_index，避免触发 embedding 服务初始化
+        if self.total_tool_count <= TOOL_COUNT_THRESHOLD:
+            logger.info(
+                f"ToolIndex 跳过构建：工具数 {self.total_tool_count} ≤ 阈值 {TOOL_COUNT_THRESHOLD}，"
+                f"走全量注入模式"
+            )
+            return
+
+        from services.mcp_tool_index import mcp_tool_index
         mcp_tool_index.build(self._tools)
         logger.info(
             f"ToolIndex 构建完成: {mcp_tool_index.size} 个工具，"
@@ -1119,6 +1120,11 @@ class MCPClientManager:
             工具 schema 列表（OpenAI Function Calling 格式），按相关性降序
             格式：[{"name": "mcp__server__tool", "description": "...", "parameters": {...}}, ...]
         """
+        # v6.2: 工具数未达阈值时直接全量返回，不 import mcp_tool_index
+        # 避免 embedding 服务初始化开销
+        if self.total_tool_count <= TOOL_COUNT_THRESHOLD:
+            return self.get_all_tools()
+
         from services.mcp_tool_index import mcp_tool_index
 
         if not mcp_tool_index.is_built:
